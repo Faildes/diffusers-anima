@@ -174,14 +174,42 @@ def _convert_anima_vae_key(key: str) -> str:
 def convert_anima_vae_state_dict(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Convert an Anima-format VAE state dict to Diffusers AutoencoderKLQwenImage layout."""
-    if "encoder.conv_in.weight" in state_dict and "quant_conv.weight" in state_dict:
-        return dict(state_dict)
+    if not state_dict:
+        return {}
 
+    # -----------------------------
+    # 1) If this looks like a full AIO, extract only VAE portion
+    # -----------------------------
+    def _extract_prefix(sd: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor] | None:
+        if any(k.startswith(prefix) for k in sd.keys()):
+            sub = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+            return sub if sub else None
+        return None
+
+    # try common VAE container prefixes (AIO / diffusers-like packs)
+    extracted = (
+        _extract_prefix(state_dict, "first_stage_model.")
+        or _extract_prefix(state_dict, "vae.")
+        or _extract_prefix(state_dict, "model.first_stage_model.")
+        or _extract_prefix(state_dict, "model.vae.")
+    )
+
+    sd = extracted if extracted is not None else dict(state_dict)
+
+    # -----------------------------
+    # 2) Already-converted diffusers layout? -> no-op
+    # -----------------------------
+    if "encoder.conv_in.weight" in sd and "quant_conv.weight" in sd:
+        return dict(sd)
+
+    # -----------------------------
+    # 3) Convert keys (your existing mapping)
+    # -----------------------------
     converted: dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        mapped_key = _convert_anima_vae_key(key)
+    for key, value in sd.items():
+        mapped_key = _convert_anima_vae_key(key)  # raises KeyError for truly unknown VAE keys
         if mapped_key in converted:
             raise RuntimeError(f"Duplicate converted VAE key: {mapped_key}")
         converted[mapped_key] = value
+
     return converted

@@ -741,7 +741,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: PromptInput,
+        prompt: PromptInput | None = None,
         negative_prompt: PromptInput | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,

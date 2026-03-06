@@ -551,6 +551,12 @@ def load_vae_single_file(
     file_path: str, device: str, dtype: torch.dtype
 ) -> AutoencoderKLQwenImage:
     state_dict = load_file(file_path, device="cpu")
+
+    if any(k.startswith("first_stage_model.") for k in state_dict.keys()):
+        state_dict = {k[len("first_stage_model."):]: v for k, v in state_dict.items() if k.startswith("first_stage_model.")}
+    elif any(k.startswith("vae.") for k in state_dict.keys()):
+        state_dict = {k[len("vae."):]: v for k, v in state_dict.items() if k.startswith("vae.")}
+
     state_dict = convert_anima_vae_state_dict(state_dict)
 
     vae = AutoencoderKLQwenImage.from_config(ANIMA_VAE_CONFIG)
