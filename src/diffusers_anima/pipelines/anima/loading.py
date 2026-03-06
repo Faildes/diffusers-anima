@@ -394,6 +394,159 @@ def _strip_model_prefix(
     return dict(state_dict)
 
 
+# ---------------------------------------------------------------------------
+# AIO single-file support
+# ---------------------------------------------------------------------------
+
+def _partition_anima_single_file_state_dict(
+    sd: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """
+    Returns (transformer_sd, text_encoder_sd, vae_sd)
+    """
+    te: dict[str, torch.Tensor] = {}
+    vae: dict[str, torch.Tensor] = {}
+    tr: dict[str, torch.Tensor] = {}
+
+    for k, v in sd.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+
+        if k.startswith("cond_stage_model.qwen3_06b."):
+            te[k] = v
+            continue
+
+        if k.startswith("first_stage_model."):
+            vae[k] = v
+            continue
+
+        if k.startswith("model.diffusion_model."):
+            tr[k] = v
+            continue
+
+        if k.startswith(("net.", "blocks.", "diffusion_model.")):
+            tr[k] = v
+            continue
+
+    return tr, te, vae
+
+
+
+def _normalize_anima_transformer_source_sd(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        k2 = k
+        if k2.startswith("net."):
+            k2 = k2[4:]
+        if k2.startswith("model.diffusion_model."):
+            k2 = k2[len("model.diffusion_model."):]
+        elif k2.startswith("diffusion_model."):
+            k2 = k2[len("diffusion_model."):]
+        out[k2] = v
+    return out
+
+
+def _normalize_qwen3_06b_text_sd(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        k2 = k
+
+        if k2.startswith("cond_stage_model.qwen3_06b."):
+            k2 = k2[len("cond_stage_model.qwen3_06b.") :]
+
+        if k2.startswith("transformer."):
+            k2 = k2[len("transformer.") :]
+
+        if k2.startswith("model."):
+            k2 = k2[len("model.") :]
+
+        out[k2] = v
+    return out
+
+
+def load_text_encoder_from_state_dict(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+) -> Qwen3Model:
+    sd = _normalize_qwen3_06b_text_sd(state_dict)
+
+    config = Qwen3Config(**QWEN3_06B_CONFIG)
+    text_encoder = Qwen3Model(config)
+
+    expected = set(text_encoder.state_dict().keys())
+    sd_filt = {k: v for k, v in sd.items() if k in expected}
+
+    missing = sorted(list(expected - set(sd_filt.keys())))
+    if missing:
+        raise RuntimeError(
+            "AIO text encoder weights are incomplete for Qwen3Model. "
+            f"Missing: {len(missing)} (e.g. {missing[:8]})"
+        )
+
+    text_encoder.load_state_dict(sd_filt, strict=False)
+    text_encoder.to(dtype=dtype)
+    text_encoder.eval().requires_grad_(False)
+    text_encoder.to(device=device, dtype=dtype)
+    return text_encoder
+
+
+def load_vae_from_state_dict(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+) -> AutoencoderKLQwenImage:
+    sd = convert_anima_vae_state_dict(state_dict)
+
+    vae = AutoencoderKLQwenImage.from_config(ANIMA_VAE_CONFIG)
+
+    expected = set(vae.state_dict().keys())
+    sd_filt = {k: v for k, v in sd.items() if k in expected}
+
+    missing = sorted(list(expected - set(sd_filt.keys())))
+    if missing:
+        raise RuntimeError(
+            "AIO VAE weights are incomplete for AutoencoderKLQwenImage. "
+            f"Missing: {len(missing)} (e.g. {missing[:8]})"
+        )
+
+    vae.load_state_dict(sd_filt, strict=False)
+    vae.to(dtype=dtype)
+    vae.eval().requires_grad_(False)
+    vae.to(device=device, dtype=dtype)
+    return vae
+
+def load_transformer_from_state_dict(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+) -> AnimaTransformerModel:
+    sd_norm = _normalize_anima_transformer_source_sd(state_dict)
+    core_state_dict, llm_adapter_state_dict = _convert_anima_state_dict_to_diffusers(sd_norm)
+
+    transformer = AnimaTransformerModel()
+    merged_state = {**core_state_dict, **llm_adapter_state_dict}
+
+    expected = set(transformer.state_dict().keys())
+    merged_filt = {k: v for k, v in merged_state.items() if k in expected}
+
+    missing = sorted(list(expected - set(merged_filt.keys())))
+    if missing:
+        raise RuntimeError(
+            "Anima transformer weights are incomplete for AnimaTransformerModel. "
+            f"Missing: {len(missing)} (e.g. {missing[:8]})"
+        )
+
+    transformer.load_state_dict(merged_filt, strict=False)
+    transformer.to(dtype=dtype)
+    transformer.eval().requires_grad_(False)
+    transformer.to(device=device, dtype=dtype)
+    return transformer
+
+
 def load_vae_single_file(
     file_path: str, device: str, dtype: torch.dtype
 ) -> AutoencoderKLQwenImage:
@@ -598,7 +751,6 @@ def _warn_unsupported_vae_feature(feature_name: str) -> None:
     warnings.warn(f"{feature_name} is not supported by this VAE.", stacklevel=2)
 
 
-
 def build_anima_pipeline(
     components: AnimaComponents,
     *,
@@ -613,12 +765,6 @@ def build_anima_pipeline(
     proxies: dict[str, str] | None = None,
     scheduler: FlowMatchEulerDiscreteScheduler | None = None,
 ) -> "AnimaPipeline":
-    """Construct an ``AnimaPipeline`` from a raw transformer checkpoint.
-
-    Used by ``AnimaPipeline.from_single_file``. All auxiliary components
-    (text encoder, VAE, tokenizers) are loaded from fixed Anima sources.
-    """
-    # Import here to avoid circular imports.
     from .pipeline_anima import AnimaPipeline
 
     resolved_device = resolve_device(device)
@@ -637,28 +783,48 @@ def build_anima_pipeline(
         execution_device=resolved_device,
     )
     warn_if_unsafe_fp16(resolved_device=resolved_device, resolved_dtype=resolved_dtype)
-    load_device = resolved_device
+
     resolved_model_path = resolve_single_file_path(
         components.model_path,
         options=load_options,
         allow_remote_url=True,
     )
 
-    transformer = load_transformer_native(
-        model_path=resolved_model_path,
-        device=load_device,
+    raw_sd = load_file(resolved_model_path, device="cpu")
+    tr_sd, te_sd, vae_sd = _partition_anima_single_file_state_dict(raw_sd)
+
+    transformer = load_transformer_from_state_dict(
+        state_dict=(tr_sd if tr_sd else raw_sd),
+        device=resolved_device,
         dtype=resolved_dtype,
     )
-    vae = load_vae(
-        device=load_device,
-        dtype=resolved_dtype,
-        options=load_options,
-    )
-    text_encoder = load_text_encoder(
-        device=load_device,
-        dtype=resolved_text_encoder_dtype,
-        options=load_options,
-    )
+
+    if vae_sd:
+        vae = load_vae_from_state_dict(
+            state_dict=vae_sd,
+            device=resolved_device,
+            dtype=resolved_dtype,
+        )
+    else:
+        vae = load_vae(
+            device=resolved_device,
+            dtype=resolved_dtype,
+            options=load_options,
+        )
+
+    if te_sd:
+        text_encoder = load_text_encoder_from_state_dict(
+            state_dict=te_sd,
+            device=resolved_device,
+            dtype=resolved_text_encoder_dtype,
+        )
+    else:
+        text_encoder = load_text_encoder(
+            device=resolved_device,
+            dtype=resolved_text_encoder_dtype,
+            options=load_options,
+        )
+
     prompt_tokenizer = load_prompt_tokenizer(
         qwen_tokenizer_source=_QWEN_TOKENIZER_SOURCE,
         t5_tokenizer_source=_T5_TOKENIZER_SOURCE,
@@ -675,7 +841,7 @@ def build_anima_pipeline(
     else:
         resolved_scheduler = coerce_anima_scheduler(resolved_scheduler)
 
-    runtime = AnimaPipeline(
+    return AnimaPipeline(
         transformer=transformer,
         vae=vae,
         scheduler=resolved_scheduler,
@@ -686,4 +852,3 @@ def build_anima_pipeline(
         text_encoder_dtype=resolved_text_encoder_dtype,
         use_module_cpu_offload=False,
     )
-    return runtime
