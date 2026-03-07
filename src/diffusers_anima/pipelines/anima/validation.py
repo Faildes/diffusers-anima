@@ -23,12 +23,38 @@ ImageBatchInput = ImageInput | list[ImageInput] | tuple[ImageInput, ...]
 
 _IMAGE_INPUT_TYPES = (Image.Image, np.ndarray, torch.Tensor, list, tuple)
 _IMAGE_BATCH_ITEM_TYPES = (Image.Image, np.ndarray, torch.Tensor)
-_SUPPORTED_SAMPLERS = set(AnimaFlowMatchEulerDiscreteScheduler.SUPPORTED_SAMPLERS)
-_SUPPORTED_SIGMA_SCHEDULES = set(
-    AnimaFlowMatchEulerDiscreteScheduler.SUPPORTED_SIGMA_SCHEDULES
+
+# ---------------------------------------------------------
+# sampler names
+# ---------------------------------------------------------
+
+_LEGACY_SAMPLER_ALIASES = {
+    "euler_a_rf": "euler_a",
+    "euler_ancestral_rf": "euler_ancestral",
+}
+
+_CANONICAL_SAMPLERS = {
+    "flowmatch_euler",
+    "euler",
+    "euler_a",
+    "euler_ancestral",
+    "er_sde",
+}
+
+_SUPPORTED_SAMPLERS = (
+    set(getattr(AnimaFlowMatchEulerDiscreteScheduler, "SUPPORTED_SAMPLERS", ()))
+    | _CANONICAL_SAMPLERS
+    | set(_LEGACY_SAMPLER_ALIASES.keys())
 )
+
+_SUPPORTED_SIGMA_SCHEDULES = set(
+    getattr(AnimaFlowMatchEulerDiscreteScheduler, "SUPPORTED_SIGMA_SCHEDULES", ())
+    or {"beta", "uniform", "simple", "normal"}
+)
+
 _SUPPORTED_CFG_BATCH_MODES = {"split", "concat"}
 _SUPPORTED_OUTPUT_TYPES = {"pil", "np", "latent"}
+
 _DIFFUSERS_COMPAT_IGNORED_SINGLE_FILE_FROM_PRETRAINED_KEYS = {
     "custom_pipeline",
     "custom_revision",
@@ -91,6 +117,15 @@ _ANIMA_SINGLE_FILE_FROM_PRETRAINED_KEYS = (
 
 
 # ---------------------------------------------------------------------------
+# helper
+# ---------------------------------------------------------------------------
+
+def _normalize_sampler_name(sampler: str) -> str:
+    s = str(sampler).strip().lower()
+    return _LEGACY_SAMPLER_ALIASES.get(s, s)
+
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -116,14 +151,20 @@ def _validate_image_like_input(
 
 
 def _validate_sampler_schedule(*, sampler: str, sigma_schedule: str) -> None:
-    if sampler not in _SUPPORTED_SAMPLERS:
+    sampler = _normalize_sampler_name(sampler)
+
+    if sampler not in (_SUPPORTED_SAMPLERS | _CANONICAL_SAMPLERS):
         raise ValueError(
-            "`sampler` must be one of: flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf."
+            "`sampler` must be one of: "
+            "flowmatch_euler, euler, euler_a, euler_ancestral, er_sde "
+            "(legacy aliases: euler_a_rf, euler_ancestral_rf)."
         )
+
     if sigma_schedule not in _SUPPORTED_SIGMA_SCHEDULES:
         raise ValueError(
             "`sigma_schedule` must be one of: beta, uniform, simple, normal."
         )
+
     if sampler == "flowmatch_euler" and sigma_schedule != "uniform":
         raise ValueError("`flowmatch_euler` requires `sigma_schedule='uniform'`.")
 
@@ -136,8 +177,10 @@ def _validate_sampling_modes(
     output_type: str,
 ) -> None:
     _validate_sampler_schedule(sampler=sampler, sigma_schedule=sigma_schedule)
+
     if cfg_batch_mode not in _SUPPORTED_CFG_BATCH_MODES:
         raise ValueError("`cfg_batch_mode` must be one of: split, concat.")
+
     if output_type not in _SUPPORTED_OUTPUT_TYPES:
         raise ValueError("`output_type` must be one of: pil, np, latent.")
 
@@ -171,14 +214,17 @@ def _warn_ignored_sampling_arguments(
     eta: float,
     s_noise: float,
 ) -> None:
+    sampler = _normalize_sampler_name(sampler)
     ignored: list[str] = []
 
+    # beta params are only used by beta schedule
     if sigma_schedule != "beta":
         if not math.isclose(beta_alpha, FORGE_BETA_ALPHA):
             ignored.append("beta_alpha")
         if not math.isclose(beta_beta, FORGE_BETA_BETA):
             ignored.append("beta_beta")
 
+    # eta / s_noise are not used by flowmatch_euler or plain euler
     if sampler in {"flowmatch_euler", "euler"}:
         if not math.isclose(eta, 1.0):
             ignored.append("eta")

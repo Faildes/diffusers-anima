@@ -271,12 +271,17 @@ def _generate_image(
     num_images_per_prompt: int = 1,
     guidance_scale: float = 4.0,
     generator: GeneratorInput | None = None,
-    sampler: str = "euler_a_rf",
+    sampler: str = "euler_a",
     sigma_schedule: str = "beta",
     beta_alpha: float = FORGE_BETA_ALPHA,
     beta_beta: float = FORGE_BETA_BETA,
     eta: float = 1.0,
     s_noise: float = 1.0,
+    solver_type: str = "midpoint",
+    max_stage: int = 2,
+    s_churn: float = 0.0,
+    s_tmin: float = 0.0,
+    s_tmax: float | None = None,
     cfg_batch_mode: str = "split",
     output_type: str = "pil",
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None = None,
@@ -285,6 +290,17 @@ def _generate_image(
     """Internal end-to-end generation routine used by ``AnimaPipeline.__call__``."""
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be >= 1")
+
+    sampler = str(sampler).lower().strip()
+
+    # backward-compatible aliases
+    if sampler == "euler_a_rf":
+        sampler = "euler_a"
+    elif sampler == "euler_ancestral_rf":
+        sampler = "euler_ancestral"
+
+    is_flowmatch = sampler == "flowmatch_euler"
+
     if prompt_embeds is not None:
         batch_size = prompt_embeds.shape[0]
         pos_hidden = pos_t5_ids = pos_t5_weights = None
@@ -310,9 +326,11 @@ def _generate_image(
         vae_scale_factor=pipe.vae_scale_factor,
         patch_size=pipe.patch_size,
     )
+
     sample_dtype = torch.float32
 
     resolved_callback_tensor_inputs = callback_on_step_end_tensor_inputs or ["latents"]
+
     init_generator, step_generator, noise_device, noise_dtype = _resolve_noise_runtime(
         execution_device=pipe.execution_device,
         generator=generator,
@@ -340,20 +358,20 @@ def _generate_image(
     sigmas: torch.Tensor | None = None
     input_is_noisy_latents = False
 
-    if sampler == "flowmatch_euler":
+    if is_flowmatch:
         flowmatch_timesteps = _trim_flowmatch_timesteps_by_strength(
             pipe,
             num_inference_steps=num_inference_steps,
             strength=strength if init_image_latents is not None else 1.0,
         )
+
         if init_image_latents is None:
             latents = randn_tensor(
                 (batch_size, 16, 1, latent_h, latent_w),
                 device=noise_device,
                 dtype=noise_dtype,
                 generator=init_generator,
-            )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+            ).to(device=pipe.execution_device, dtype=sample_dtype)
         else:
             init_image_latents = align_tensor_batch_size(
                 init_image_latents,
@@ -366,18 +384,18 @@ def _generate_image(
                 dtype=noise_dtype,
                 generator=init_generator,
             ).to(device=pipe.execution_device, dtype=sample_dtype)
+
             start_timestep = (
                 flowmatch_timesteps[:1]
                 .expand(init_image_latents.shape[0])
-                .to(
-                    device=pipe.execution_device,
-                    dtype=torch.float32,
-                )
+                .to(device=pipe.execution_device, dtype=torch.float32)
             )
+
             latents = pipe.scheduler.scale_noise(
-                init_image_latents, start_timestep, init_noise
-            )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+                init_image_latents,
+                start_timestep,
+                init_noise,
+            ).to(device=pipe.execution_device, dtype=sample_dtype)
     else:
         sigmas = build_sampling_sigmas(
             pipe.scheduler,
@@ -387,14 +405,14 @@ def _generate_image(
             beta_beta=beta_beta,
             device=pipe.execution_device,
         )
+
         if init_image_latents is None:
             latents = randn_tensor(
                 (batch_size, 16, 1, latent_h, latent_w),
                 device=noise_device,
                 dtype=noise_dtype,
                 generator=init_generator,
-            )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+            ).to(device=pipe.execution_device, dtype=sample_dtype)
         else:
             init_image_latents = align_tensor_batch_size(
                 init_image_latents,
@@ -411,9 +429,11 @@ def _generate_image(
                 dtype=noise_dtype,
                 generator=init_generator,
             ).to(device=pipe.execution_device, dtype=sample_dtype)
+
             sigma_start = sigmas[0].to(init_image_latents.dtype)
             latents = (
-                sigma_start * init_noise + (1.0 - sigma_start) * init_image_latents
+                sigma_start * init_noise
+                + (1.0 - sigma_start) * init_image_latents
             )
             input_is_noisy_latents = True
 
@@ -425,10 +445,12 @@ def _generate_image(
     ):
         if prompt_embeds is not None:
             pos_cond = prompt_embeds.to(
-                device=pipe.execution_device, dtype=pipe.model_dtype
+                device=pipe.execution_device,
+                dtype=pipe.model_dtype,
             )
             neg_cond = negative_prompt_embeds.to(  # type: ignore[union-attr]
-                device=pipe.execution_device, dtype=pipe.model_dtype
+                device=pipe.execution_device,
+                dtype=pipe.model_dtype,
             )
         else:
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
@@ -441,11 +463,10 @@ def _generate_image(
                 neg_t5_weights=neg_t5_weights,
             )
 
-        if sampler == "flowmatch_euler":
+        if is_flowmatch:
             if flowmatch_timesteps is None:
-                raise RuntimeError(
-                    "Internal error: flowmatch timesteps were not initialized."
-                )
+                raise RuntimeError("Internal error: flowmatch timesteps were not initialized.")
+
             latents = sample_flowmatch_euler(
                 pipe.transformer,
                 pipe.scheduler,
@@ -466,9 +487,8 @@ def _generate_image(
             )
         else:
             if sigmas is None:
-                raise RuntimeError(
-                    "Internal error: sigma schedule was not initialized."
-                )
+                raise RuntimeError("Internal error: sigma schedule was not initialized.")
+
             latents = run_const_sigma_samplers(
                 pipe.transformer,
                 pipe,
@@ -489,6 +509,11 @@ def _generate_image(
                 inpaint_mask=inpaint_mask,
                 init_image_latents=init_image_latents,
                 init_noise=init_noise,
+                solver_type=solver_type,
+                max_stage=max_stage,
+                s_churn=s_churn,
+                s_tmin=s_tmin,
+                s_tmax=s_tmax,
             )
 
     if output_type == "latent":
@@ -806,6 +831,11 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         beta_beta = sampling_config.beta_beta
         eta = sampling_config.eta
         s_noise = sampling_config.s_noise
+        solver_type = sampling_config.solver_type
+        max_stage = sampling_config.max_stage
+        s_churn = sampling_config.s_churn
+        s_tmin = sampling_config.s_tmin
+        s_tmax = sampling_config.s_tmax
         resolved_callback_tensor_inputs = callback_on_step_end_tensor_inputs
         if resolved_callback_tensor_inputs is None:
             resolved_callback_tensor_inputs = ["latents"]
@@ -860,6 +890,11 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 beta_beta=beta_beta,
                 eta=eta,
                 s_noise=s_noise,
+                solver_type=solver_type,
+                max_stage=max_stage,
+                s_churn=s_churn,
+                s_tmin=s_tmin,
+                s_tmax=s_tmax,
                 cfg_batch_mode=cfg_batch_mode,
                 output_type=output_type,
                 callback_on_step_end=callback_on_step_end,

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import torch
 
@@ -13,20 +11,62 @@ from .constants import ANIMA_SAMPLING_MULTIPLIER, FORGE_BETA_ALPHA, FORGE_BETA_B
 def _time_snr_shift(alpha: float, t: torch.Tensor) -> torch.Tensor:
     if alpha == 1.0:
         return t
-    numerator = torch.mul(t, alpha)
-    denominator = torch.add(torch.mul(t, alpha - 1.0), 1.0)
-    return torch.div(numerator, denominator)
+    numerator = t * alpha
+    denominator = t * (alpha - 1.0) + 1.0
+    return numerator / denominator
+
+
+def _build_base_sigmas(
+    *,
+    num_train_timesteps: int,
+    shift: float,
+    device: str,
+) -> torch.Tensor:
+    # 0..1 の正規化時間で統一
+    t = (
+        torch.arange(1, num_train_timesteps + 1, dtype=torch.float32, device=device)
+        / float(num_train_timesteps)
+    )
+    base_sigmas = _time_snr_shift(shift, t).to(dtype=torch.float32)
+    return base_sigmas
+
+
+def _sanitize_sigmas(sigmas: torch.Tensor) -> torch.Tensor:
+    sigmas = sigmas.detach().to(dtype=torch.float32)
+    sigmas = torch.nan_to_num(sigmas, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+    if sigmas.numel() == 0:
+        return sigmas
+
+    if sigmas[0] < sigmas[-1]:
+        sigmas = torch.flip(sigmas, dims=[0])
+
+    fixed = sigmas.clone()
+    for i in range(1, fixed.numel()):
+        if fixed[i] > fixed[i - 1]:
+            fixed[i] = fixed[i - 1]
+
+    if fixed[-1].item() != 0.0:
+        fixed = torch.cat([fixed, fixed.new_zeros(1)], dim=0)
+
+    return fixed
 
 
 def build_simple_sigmas(base_sigmas: torch.Tensor, *, steps: int) -> torch.Tensor:
-    """Select sigmas for the simple schedule."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
 
-    stride = len(base_sigmas) / float(steps)
-    picked = [float(base_sigmas[-(1 + int(i * stride))].item()) for i in range(steps)]
-    picked.append(0.0)
-    return torch.tensor(picked, device=base_sigmas.device, dtype=torch.float32)
+    idx = torch.linspace(
+        base_sigmas.numel() - 1,
+        0,
+        steps,
+        device=base_sigmas.device,
+        dtype=torch.float32,
+    ).round().long()
+
+    sigmas = base_sigmas.index_select(0, idx)
+    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)], dim=0)
+    return _sanitize_sigmas(sigmas)
 
 
 def build_beta_sigmas(
@@ -38,14 +78,13 @@ def build_beta_sigmas(
     beta_beta: float,
     device: str,
 ) -> torch.Tensor:
-    """Build beta-distribution sigma schedule."""
     from scipy import stats
 
-    t = (
-        torch.arange(1, num_train_timesteps + 1, dtype=torch.float32, device=device)
-        / float(num_train_timesteps)
-    ) * ANIMA_SAMPLING_MULTIPLIER
-    base_sigmas = _time_snr_shift(shift, t)
+    base_sigmas = _build_base_sigmas(
+        num_train_timesteps=num_train_timesteps,
+        shift=shift,
+        device=device,
+    )
 
     total_timesteps = len(base_sigmas) - 1
     ts = 1.0 - np.linspace(0.0, 1.0, num_inference_steps, endpoint=False)
@@ -53,15 +92,15 @@ def build_beta_sigmas(
     mapped = np.nan_to_num(mapped, nan=0.0, posinf=float(total_timesteps), neginf=0.0)
     indices = np.clip(np.rint(mapped).astype(np.int64), 0, total_timesteps)
 
-    sigmas: list[float] = []
-    last_index: int | None = None
+    sigmas = []
+    last_index = None
     for index in indices:
-        if last_index is None or index != last_index:
+        if last_index is None or int(index) != last_index:
             sigmas.append(float(base_sigmas[int(index)].item()))
         last_index = int(index)
 
     sigmas.append(0.0)
-    return torch.tensor(sigmas, device=device, dtype=torch.float32)
+    return _sanitize_sigmas(torch.tensor(sigmas, device=device, dtype=torch.float32))
 
 
 def build_normal_sigmas(
@@ -71,47 +110,24 @@ def build_normal_sigmas(
     shift: float,
     device: str,
 ) -> torch.Tensor:
-    """Build normal (linearly-spaced) sigma schedule."""
-    multiplier = float(ANIMA_SAMPLING_MULTIPLIER)
+    base_sigmas = _build_base_sigmas(
+        num_train_timesteps=num_train_timesteps,
+        shift=shift,
+        device=device,
+    )
 
-    t = (
-        torch.arange(
-            1,
-            num_train_timesteps + 1,
-            dtype=torch.float32,
-            device=device,
-        )
-        / float(num_train_timesteps)
-    ) * multiplier
-    base_sigmas = _time_snr_shift(shift, t / multiplier)
-    sigma_min = base_sigmas[0]
     sigma_max = base_sigmas[-1]
+    sigma_min = base_sigmas[0]
 
-    start = sigma_max * multiplier
-    end = sigma_min * multiplier
-
-    append_zero = True
-    sigma_at_end = _time_snr_shift(shift, end / multiplier)
-    if math.isclose(float(sigma_at_end.item()), 0.0, abs_tol=1e-5):
-        num_inference_steps += 1
-        append_zero = False
-
-    timesteps = torch.linspace(
-        start,
-        end,
+    sigmas = torch.linspace(
+        sigma_max,
+        sigma_min,
         num_inference_steps,
         device=device,
         dtype=torch.float32,
     )
-    sigmas = _time_snr_shift(shift, timesteps / multiplier).to(dtype=torch.float32)
-    if append_zero:
-        sigmas = torch.cat(
-            [
-                sigmas,
-                torch.zeros(1, device=device, dtype=torch.float32),
-            ]
-        )
-    return sigmas
+    sigmas = torch.cat([sigmas, torch.zeros(1, device=device, dtype=torch.float32)], dim=0)
+    return _sanitize_sigmas(sigmas)
 
 
 def build_sampling_sigmas(
@@ -123,23 +139,8 @@ def build_sampling_sigmas(
     beta_beta: float = FORGE_BETA_BETA,
     device: str,
 ) -> torch.Tensor:
-    """Build sigma trajectories for Anima custom samplers.
-
-    Args:
-        scheduler: An ``AnimaFlowMatchEulerDiscreteScheduler`` instance.
-        num_inference_steps: Number of denoising steps.
-        sigma_schedule: One of ``beta``, ``simple``, ``normal``, or ``uniform``.
-        beta_alpha: Alpha parameter for the beta distribution (used when
-            ``sigma_schedule='beta'``).
-        beta_beta: Beta parameter for the beta distribution (used when
-            ``sigma_schedule='beta'``).
-        device: Target device string.
-
-    Returns:
-        A 1-D tensor of sigmas with a trailing zero appended.
-    """
-    shift = float(scheduler.config.shift)  # type: ignore[union-attr]
-    num_train_timesteps = int(scheduler.config.num_train_timesteps)  # type: ignore[union-attr]
+    shift = float(scheduler.config.shift)
+    num_train_timesteps = int(scheduler.config.num_train_timesteps)
 
     if sigma_schedule == "normal":
         return build_normal_sigmas(
@@ -150,16 +151,11 @@ def build_sampling_sigmas(
         )
 
     if sigma_schedule == "simple":
-        t = (
-            torch.arange(
-                1,
-                num_train_timesteps + 1,
-                dtype=torch.float32,
-                device=device,
-            )
-            / float(num_train_timesteps)
-        ) * ANIMA_SAMPLING_MULTIPLIER
-        base_sigmas = _time_snr_shift(shift, t)
+        base_sigmas = _build_base_sigmas(
+            num_train_timesteps=num_train_timesteps,
+            shift=shift,
+            device=device,
+        )
         return build_simple_sigmas(base_sigmas, steps=num_inference_steps)
 
     if sigma_schedule == "beta":
@@ -172,6 +168,5 @@ def build_sampling_sigmas(
             device=device,
         )
 
-    # "uniform" — delegate to the scheduler's own set_timesteps
-    scheduler.set_timesteps(num_inference_steps, device=device)  # type: ignore[union-attr]
-    return scheduler.sigmas.to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+    scheduler.set_timesteps(num_inference_steps, device=device)
+    return _sanitize_sigmas(scheduler.sigmas.to(device=device, dtype=torch.float32))
