@@ -210,27 +210,32 @@ def encode_image_to_latents(
     sample_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Encode a BCHW image tensor to latents and apply the Anima latent normalisation."""
-    image = image_tensor.to(device=execution_device, dtype=model_dtype).unsqueeze(2)
+    image = image_tensor.to(device=execution_device, dtype=torch.float32).unsqueeze(2)
+
     with torch.inference_mode():
-        encoded = vae.encode(image)
+        encoded = vae.encode(image.to(dtype=vae.dtype))
+
     image_latents = _retrieve_vae_latents(encoded, generator=generator).to(
-        dtype=sample_dtype
+        device=execution_device,
+        dtype=torch.float32,
     )
 
     latents_mean = torch.tensor(
         vae.config.latents_mean,
-        dtype=image_latents.dtype,
+        dtype=torch.float32,
         device=image_latents.device,
     ).view(1, 16, 1, 1, 1)
-    latents_std = (
-        1.0
-        / torch.tensor(
-            vae.config.latents_std,
-            dtype=image_latents.dtype,
-            device=image_latents.device,
-        )
+
+    latents_std = torch.tensor(
+        vae.config.latents_std,
+        dtype=torch.float32,
+        device=image_latents.device,
     ).view(1, 16, 1, 1, 1)
-    return (image_latents - latents_mean) * latents_std
+
+    # encode: (z - mean) / std
+    image_latents = (image_latents - latents_mean) / latents_std
+
+    return image_latents.to(dtype=sample_dtype)
 
 
 def _ensure_finite(
@@ -256,19 +261,30 @@ def decode_latents(
 ) -> list[Image.Image]:
     """Decode latents to PIL images, applying inverse Anima latent statistics."""
     _ensure_finite(latents, name="latents before decode", runtime_dtype=runtime_dtype)
-    latents = latents.to(vae.dtype)
+
+    latents = latents.to(device=next(vae.parameters()).device, dtype=torch.float32)
+
     latents_mean = torch.tensor(
-        vae.config.latents_mean, dtype=latents.dtype, device=latents.device
+        vae.config.latents_mean,
+        dtype=torch.float32,
+        device=latents.device,
     ).view(1, 16, 1, 1, 1)
+
     latents_std = torch.tensor(
-        vae.config.latents_std, dtype=latents.dtype, device=latents.device
+        vae.config.latents_std,
+        dtype=torch.float32,
+        device=latents.device,
     ).view(1, 16, 1, 1, 1)
+
     latents = latents * latents_std + latents_mean
+
+    latents = latents.to(dtype=vae.dtype)
 
     with torch.inference_mode():
         image = vae.decode(latents, return_dict=False)[0][:, :, 0]
 
     _ensure_finite(image, name="VAE decode output", runtime_dtype=runtime_dtype)
+
     image = image.float().clamp(-1.0, 1.0)
     image = ((image + 1.0) / 2.0).clamp(0.0, 1.0)
     image_np = image.permute(0, 2, 3, 1).cpu().numpy()

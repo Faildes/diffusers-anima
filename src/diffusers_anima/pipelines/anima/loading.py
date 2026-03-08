@@ -109,6 +109,13 @@ def resolve_text_encoder_dtype(
         return torch.float32
     return resolved_dtype
 
+def resolve_vae_dtype(
+    *,
+    model_dtype: torch.dtype,
+    execution_device: str,
+) -> torch.dtype:
+    return torch.float32
+
 
 def warn_if_unsafe_fp16(*, resolved_device: str, resolved_dtype: torch.dtype) -> None:
     if resolved_device == "cuda" and resolved_dtype == torch.float16:
@@ -695,12 +702,18 @@ def normalize_loaded_component_buffers(pipe: "DiffusionPipeline") -> None:
     """Normalize component runtime buffers after Diffusers ``from_pretrained``."""
     for component_name in ("text_encoder", "transformer", "vae"):
         _recast_module_to_parameter_dtype(getattr(pipe, component_name, None))
+
     transformer_dtype = module_parameter_dtype(getattr(pipe, "transformer", None))
     if transformer_dtype is not None:
         pipe.model_dtype = transformer_dtype
+
     text_encoder_dtype = module_parameter_dtype(getattr(pipe, "text_encoder", None))
     if text_encoder_dtype is not None:
         pipe.text_encoder_dtype = text_encoder_dtype
+
+    vae_dtype = module_parameter_dtype(getattr(pipe, "vae", None))
+    if vae_dtype is not None:
+        pipe.vae_dtype = vae_dtype
 
 
 def resolve_vae_scale_factor(*, vae: AutoencoderKLQwenImage) -> int:
@@ -788,6 +801,11 @@ def build_anima_pipeline(
         text_encoder_dtype=text_encoder_dtype,
         execution_device=resolved_device,
     )
+    resolved_vae_dtype = resolve_vae_dtype(
+        model_dtype=resolved_dtype,
+        execution_device=resolved_device,
+    )
+
     warn_if_unsafe_fp16(resolved_device=resolved_device, resolved_dtype=resolved_dtype)
 
     resolved_model_path = resolve_single_file_path(
@@ -809,12 +827,12 @@ def build_anima_pipeline(
         vae = load_vae_from_state_dict(
             state_dict=vae_sd,
             device=resolved_device,
-            dtype=resolved_dtype,
+            dtype=resolved_vae_dtype,
         )
     else:
         vae = load_vae(
             device=resolved_device,
-            dtype=resolved_dtype,
+            dtype=resolved_vae_dtype,
             options=load_options,
         )
 
@@ -856,5 +874,6 @@ def build_anima_pipeline(
         execution_device=resolved_device,
         model_dtype=resolved_dtype,
         text_encoder_dtype=resolved_text_encoder_dtype,
+        vae_dtype=resolved_vae_dtype,
         use_module_cpu_offload=False,
     )

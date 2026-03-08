@@ -209,14 +209,14 @@ def _prepare_init_image_latents_and_inpaint_mask(
     with _module_execution_context(
         pipe.vae,
         execution_device=pipe.execution_device,
-        execution_dtype=pipe.model_dtype,
+        execution_dtype=pipe.vae_dtype,
         enable_offload=pipe.use_module_cpu_offload,
     ):
         init_image_latents = encode_image_to_latents(
             pipe.vae,
             image_tensor=init_image_tensor,
             execution_device=pipe.execution_device,
-            model_dtype=pipe.model_dtype,
+            model_dtype=pipe.vae_dtype,
             generator=init_generator,
             sample_dtype=sample_dtype,
         )
@@ -522,10 +522,10 @@ def _generate_image(
     with _module_execution_context(
         pipe.vae,
         execution_device=pipe.execution_device,
-        execution_dtype=pipe.model_dtype,
+        execution_dtype=pipe.vae_dtype,
         enable_offload=pipe.use_module_cpu_offload,
     ):
-        return decode_latents(pipe.vae, latents, runtime_dtype=pipe.model_dtype)
+        return decode_latents(pipe.vae, latents, runtime_dtype=pipe.vae_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +548,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     execution_device: str
     model_dtype: torch.dtype
     text_encoder_dtype: torch.dtype
+    vae_dtype: torch.dtype
     use_module_cpu_offload: bool
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     # prompt_tokenizer is intentionally NOT registered via register_modules because
@@ -568,6 +569,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         execution_device: str = "auto",
         model_dtype: torch.dtype = torch.float32,
         text_encoder_dtype: torch.dtype = torch.float32,
+        vae_dtype: torch.dtype = torch.float32,
         use_module_cpu_offload: bool = False,
     ):
         super().__init__()
@@ -579,14 +581,13 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             text_encoder=text_encoder,
         )
 
-        # Diffusers passes [None, None] for model_index.json entries with null library/class.
-        # Normalize to None so downstream checks work correctly.
         if isinstance(prompt_tokenizer, (list, tuple)):
             prompt_tokenizer = None
         self.prompt_tokenizer = prompt_tokenizer
         self.execution_device = execution_device
         self.model_dtype = model_dtype
         self.text_encoder_dtype = text_encoder_dtype
+        self.vae_dtype = vae_dtype
         self.use_module_cpu_offload = use_module_cpu_offload
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
