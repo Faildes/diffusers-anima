@@ -9,8 +9,6 @@ if TYPE_CHECKING:
 from .common import (
     randn_like,
     sanitize_sigmas,
-    to_d,
-    get_ancestral_step,
     predict_denoised_const,
     run_step_callback,
     apply_inpaint_source,
@@ -39,7 +37,9 @@ def sample_euler_ancestral(
     init_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if inpaint_mask is not None and (init_image_latents is None or init_noise is None):
-        raise ValueError("inpaint sampling requires both `init_image_latents` and `init_noise`.")
+        raise ValueError(
+            "inpaint sampling requires both `init_image_latents` and `init_noise`."
+        )
 
     sigmas = sanitize_sigmas(sigmas)
     latents = latents.float()
@@ -51,34 +51,49 @@ def sample_euler_ancestral(
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
 
-        denoised = predict_denoised_const(
-            transformer,
-            latents,
-            sigma=sigma,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
-        )
+        denoised = model(latents, sigma)
 
         if sigma_next.item() == 0.0:
             latents = denoised
         else:
-            sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta=eta)
-            d = to_d(latents, sigma, denoised)
+            sigma_f = sigma.float().clamp_min(1e-8)
+            sigma_next_f = sigma_next.float()
 
-            dt = (sigma_down - sigma).to(torch.float32)
-            while dt.ndim < latents.ndim:
-                dt = dt.unsqueeze(-1)
-            latents = latents + d * dt
+            downstep_ratio = 1.0 + (sigma_next_f / sigma_f - 1.0) * float(eta)
+            sigma_down = sigma_next_f * downstep_ratio
 
-            if float(sigma_up.item()) > 0.0:
-                sigma_up_v = sigma_up.to(torch.float32)
-                while sigma_up_v.ndim < latents.ndim:
-                    sigma_up_v = sigma_up_v.unsqueeze(-1)
+            alpha_ip1 = (1.0 - sigma_next_f).clamp_min(1e-8)
+            alpha_down = (1.0 - sigma_down).clamp_min(1e-8)
+
+            renoise_sq = sigma_next_f**2 - (
+                sigma_down**2 * alpha_ip1**2 / alpha_down**2
+            )
+            renoise_coeff = torch.sqrt(torch.clamp(renoise_sq, min=0.0))
+
+            sigma_down_ratio = sigma_down / sigma_f
+            while sigma_down_ratio.ndim < latents.ndim:
+                sigma_down_ratio = sigma_down_ratio.unsqueeze(-1)
+
+            latents = (
+                sigma_down_ratio.to(latents.dtype) * latents
+                + (1.0 - sigma_down_ratio.to(latents.dtype)) * denoised
+            )
+
+            if eta > 0.0 and float(renoise_coeff.item()) > 0.0:
                 noise = randn_like(latents, generator=generator).float()
-                latents = latents + noise * s_noise * sigma_up_v
+
+                alpha_ratio = (alpha_ip1 / alpha_down).to(torch.float32)
+                while alpha_ratio.ndim < latents.ndim:
+                    alpha_ratio = alpha_ratio.unsqueeze(-1)
+
+                renoise_coeff_v = renoise_coeff.to(torch.float32)
+                while renoise_coeff_v.ndim < latents.ndim:
+                    renoise_coeff_v = renoise_coeff_v.unsqueeze(-1)
+
+                latents = (
+                    alpha_ratio.to(latents.dtype) * latents
+                    + noise * float(s_noise) * renoise_coeff_v.to(latents.dtype)
+                )
 
             latents = apply_inpaint_source(
                 latents,
@@ -88,7 +103,11 @@ def sample_euler_ancestral(
                 init_noise=init_noise,
             )
 
-        _ensure_finite(latents, name="latents after Euler ancestral step", runtime_dtype=torch.float32)
+        _ensure_finite(
+            latents,
+            name="latents after Euler ancestral RF step",
+            runtime_dtype=torch.float32,
+        )
 
         latents = run_step_callback(
             pipeline,

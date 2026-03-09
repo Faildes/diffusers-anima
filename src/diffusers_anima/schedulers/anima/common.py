@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Callable, TYPE_CHECKING
-import math
 import torch
 
 if TYPE_CHECKING:
@@ -46,9 +45,19 @@ def randn_tensor(
         generator.device.type if hasattr(generator, "device") else target_device.type
     )
     if generator_device == target_device.type:
-        return torch.randn(shape, device=target_device, dtype=dtype, generator=generator)
+        return torch.randn(
+            shape,
+            device=target_device,
+            dtype=dtype,
+            generator=generator,
+        )
 
-    noise = torch.randn(shape, device=generator.device, dtype=torch.float32, generator=generator)
+    noise = torch.randn(
+        shape,
+        device=generator.device,
+        dtype=torch.float32,
+        generator=generator,
+    )
     return noise.to(device=target_device, dtype=dtype)
 
 
@@ -91,9 +100,20 @@ def sanitize_sigmas(sigmas: torch.Tensor) -> torch.Tensor:
     return fixed
 
 
-def to_d(latents: torch.Tensor, sigma: torch.Tensor, denoised: torch.Tensor) -> torch.Tensor:
-    sigma = append_dims(sigma.to(device=latents.device, dtype=latents.dtype), latents.ndim)
-    sigma = sigma.clamp_min(1e-8)
+def _safe_signed_denom(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    sign = torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+    return torch.where(x.abs() < eps, sign * eps, x)
+
+
+def to_d(
+    latents: torch.Tensor,
+    sigma: torch.Tensor,
+    denoised: torch.Tensor,
+) -> torch.Tensor:
+    sigma = append_dims(
+        sigma.to(device=latents.device, dtype=latents.dtype),
+        latents.ndim,
+    ).clamp_min(1e-8)
     return (latents - denoised) / sigma
 
 
@@ -113,13 +133,46 @@ def get_ancestral_step(
         eta
         * torch.sqrt(
             torch.clamp(
-                sigma_to_f**2 * (sigma_from_f**2 - sigma_to_f**2) / torch.clamp(sigma_from_f**2, min=1e-12),
+                sigma_to_f**2
+                * (sigma_from_f**2 - sigma_to_f**2)
+                / torch.clamp(sigma_from_f**2, min=1e-12),
                 min=0.0,
             )
         ),
     )
     sigma_down = torch.sqrt(torch.clamp(sigma_to_f**2 - sigma_up**2, min=0.0))
     return sigma_down, sigma_up
+
+
+# ------------------------------------------------------------------
+# CONST / RF helpers for Anima
+# ------------------------------------------------------------------
+
+def offset_first_sigma_for_snr_const(
+    sigmas: torch.Tensor,
+    *,
+    percent_offset: float = 1e-4,
+) -> torch.Tensor:
+    if sigmas.numel() <= 1:
+        return sigmas
+    if float(sigmas[0].item()) >= 1.0:
+        sigmas = sigmas.clone()
+        sigmas[0] = sigmas.new_tensor(1.0 - percent_offset)
+    return sigmas
+
+
+def sigma_to_half_log_snr_const(sigmas: torch.Tensor) -> torch.Tensor:
+    sigmas = sigmas.to(torch.float32).clamp(1e-6, 1.0 - 1e-6)
+    return -torch.logit(sigmas)
+
+
+def half_log_snr_to_sigma_const(half_log_snr: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(-half_log_snr)
+
+
+def default_er_sde_noise_scaler(er_lambda: torch.Tensor) -> torch.Tensor:
+    er_lambda = er_lambda.to(torch.float32).clamp_min(1e-12)
+    return er_lambda * (torch.exp(er_lambda.pow(0.3)) + 10.0)
 
 
 def predict_noise_cfg(
@@ -162,13 +215,19 @@ def predict_noise_cfg(
             noise_pred_uncond = transformer(
                 model_input,
                 timestep,
-                encoder_hidden_states=neg_cond.to(device=model_input.device, dtype=model_dtype),
+                encoder_hidden_states=neg_cond.to(
+                    device=model_input.device,
+                    dtype=model_dtype,
+                ),
                 return_dict=False,
             )[0]
             noise_pred_text = transformer(
                 model_input,
                 timestep,
-                encoder_hidden_states=pos_cond.to(device=model_input.device, dtype=model_dtype),
+                encoder_hidden_states=pos_cond.to(
+                    device=model_input.device,
+                    dtype=model_dtype,
+                ),
                 return_dict=False,
             )[0]
     else:
@@ -225,7 +284,12 @@ def run_step_callback(
     if "latents" in callback_on_step_end_tensor_inputs:
         callback_kwargs["latents"] = latents
 
-    callback_outputs = callback_on_step_end(pipeline, step_index, timestep, callback_kwargs)
+    callback_outputs = callback_on_step_end(
+        pipeline,
+        step_index,
+        timestep,
+        callback_kwargs,
+    )
     if callback_outputs is None:
         return latents
     if not isinstance(callback_outputs, dict):
@@ -246,8 +310,14 @@ def apply_inpaint_source(
         return latents
 
     sigma_next_value = append_dims(
-        sigma_next.to(device=init_image_latents.device, dtype=init_image_latents.dtype),
+        sigma_next.to(
+            device=init_image_latents.device,
+            dtype=init_image_latents.dtype,
+        ),
         init_image_latents.ndim,
     )
-    source_latents = sigma_next_value * init_noise + (1.0 - sigma_next_value) * init_image_latents
+    source_latents = (
+        sigma_next_value * init_noise
+        + (1.0 - sigma_next_value) * init_image_latents
+    )
     return (1.0 - inpaint_mask) * source_latents + inpaint_mask * latents

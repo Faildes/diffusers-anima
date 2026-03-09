@@ -5,13 +5,12 @@ import math
 import torch
 
 if TYPE_CHECKING:
-    from diffusers import DiffusionPipeline, ModelMixin
+    from diffusers import DiffusionPipeline
 
 from .common import (
     randn_like,
     sanitize_sigmas,
     to_d,
-    predict_denoised_const,
     run_step_callback,
     apply_inpaint_source,
 )
@@ -19,16 +18,11 @@ from ...pipelines.anima.image_processing import _ensure_finite
 
 
 def sample_euler(
-    transformer: "ModelMixin",
+    model: Any,
     pipeline: "DiffusionPipeline",
     latents: torch.Tensor,
     *,
     sigmas: torch.Tensor,
-    pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
-    guidance_scale: float,
-    cfg_batch_mode: str,
-    model_dtype: torch.dtype,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     inpaint_mask: torch.Tensor | None = None,
@@ -62,18 +56,11 @@ def sample_euler(
 
         if gamma > 0.0:
             eps = randn_like(latents, generator=generator).float()
-            latents = latents + eps * s_noise * torch.sqrt(torch.clamp(sigma_hat**2 - sigma**2, min=0.0))
+            latents = latents + eps * s_noise * torch.sqrt(
+                torch.clamp(sigma_hat**2 - sigma**2, min=0.0)
+            )
 
-        denoised = predict_denoised_const(
-            transformer,
-            latents,
-            sigma=sigma_hat,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
-        )
+        denoised = model(latents, sigma_hat)
 
         if sigma_next.item() == 0.0:
             latents = denoised
@@ -82,6 +69,7 @@ def sample_euler(
             dt = (sigma_next - sigma_hat).to(torch.float32)
             while dt.ndim < latents.ndim:
                 dt = dt.unsqueeze(-1)
+
             latents = latents + d * dt
             latents = apply_inpaint_source(
                 latents,

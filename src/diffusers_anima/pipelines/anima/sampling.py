@@ -15,6 +15,7 @@ from ...schedulers.anima import (
     sample_euler_ancestral as _sample_euler_ancestral,
     sample_er_sde as _sample_er_sde,
 )
+from ...schedulers.anima.common import predict_denoised_const
 
 
 GeneratorInput = torch.Generator | list[torch.Generator] | tuple[torch.Generator, ...]
@@ -29,6 +30,61 @@ _LEGACY_SAMPLER_ALIASES = {
 def _normalize_sampler_name(sampler: str) -> str:
     sampler = str(sampler).strip().lower()
     return _LEGACY_SAMPLER_ALIASES.get(sampler, sampler)
+
+
+class AnimaConstSamplerModel:
+    def __init__(
+        self,
+        transformer: "ModelMixin",
+        *,
+        pos_cond: torch.Tensor,
+        neg_cond: torch.Tensor,
+        guidance_scale: float,
+        cfg_batch_mode: str,
+        model_dtype: torch.dtype,
+    ) -> None:
+        self.transformer = transformer
+        self.pos_cond = pos_cond
+        self.neg_cond = neg_cond
+        self.guidance_scale = float(guidance_scale)
+        self.cfg_batch_mode = str(cfg_batch_mode)
+        self.model_dtype = model_dtype
+
+    @torch.inference_mode()
+    def __call__(self, latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.to(device=latents.device, dtype=torch.float32)
+        if sigma.ndim == 0:
+            sigma = sigma.expand(latents.shape[0])
+
+        return predict_denoised_const(
+            self.transformer,
+            latents,
+            sigma=sigma,
+            pos_cond=self.pos_cond,
+            neg_cond=self.neg_cond,
+            guidance_scale=self.guidance_scale,
+            cfg_batch_mode=self.cfg_batch_mode,
+            model_dtype=self.model_dtype,
+        )
+
+
+def build_const_sampler_model(
+    transformer: "ModelMixin",
+    *,
+    pos_cond: torch.Tensor,
+    neg_cond: torch.Tensor,
+    guidance_scale: float,
+    cfg_batch_mode: str,
+    model_dtype: torch.dtype,
+) -> AnimaConstSamplerModel:
+    return AnimaConstSamplerModel(
+        transformer,
+        pos_cond=pos_cond,
+        neg_cond=neg_cond,
+        guidance_scale=guidance_scale,
+        cfg_batch_mode=cfg_batch_mode,
+        model_dtype=model_dtype,
+    )
 
 
 def sample_flowmatch_euler(
@@ -71,20 +127,15 @@ def sample_flowmatch_euler(
 
 
 def run_const_sigma_samplers(
-    transformer: "ModelMixin",
+    model: Any,
     pipeline: "DiffusionPipeline",
     latents: torch.Tensor,
     *,
     sigmas: torch.Tensor,
     sampler: str,
-    pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
-    guidance_scale: float,
     eta: float,
     s_noise: float,
     generator: torch.Generator | list[torch.Generator] | None,
-    cfg_batch_mode: str,
-    model_dtype: torch.dtype,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     input_is_noisy_latents: bool = False,
@@ -97,14 +148,6 @@ def run_const_sigma_samplers(
     s_tmin: float = 0.0,
     s_tmax: float | None = None,
 ) -> torch.Tensor:
-    """
-    Dispatch to the selected non-flowmatch sampler.
-
-    Notes:
-      - legacy aliases euler_a_rf / euler_ancestral_rf are normalized.
-      - s_tmax=None is converted to +inf for samplers that expect a float range.
-      - latents are promoted to float32 for numerical stability.
-    """
     if len(sigmas) < 2:
         raise ValueError("At least 1 denoising step is required.")
 
@@ -118,15 +161,10 @@ def run_const_sigma_samplers(
 
     if sampler == "euler":
         return _sample_euler(
-            transformer,
+            model,
             pipeline,
             latents,
             sigmas=sigmas,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             inpaint_mask=inpaint_mask,
@@ -141,18 +179,13 @@ def run_const_sigma_samplers(
 
     if sampler in {"euler_a", "euler_ancestral"}:
         return _sample_euler_ancestral(
-            transformer,
+            model,
             pipeline,
             latents,
             sigmas=sigmas,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
             eta=float(eta),
             s_noise=float(s_noise),
             generator=generator,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             inpaint_mask=inpaint_mask,
@@ -162,18 +195,13 @@ def run_const_sigma_samplers(
 
     if sampler == "er_sde":
         return _sample_er_sde(
-            transformer,
+            model,
             pipeline,
             latents,
             sigmas=sigmas,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
             eta=float(eta),
             s_noise=float(s_noise),
             generator=generator,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             inpaint_mask=inpaint_mask,
@@ -193,6 +221,7 @@ __all__ = [
     "GeneratorInput",
     "randn_tensor",
     "randn_like",
+    "build_const_sampler_model",
     "sample_flowmatch_euler",
     "run_const_sigma_samplers",
 ]

@@ -9,11 +9,13 @@ if TYPE_CHECKING:
 from .common import (
     randn_like,
     sanitize_sigmas,
-    to_d,
-    get_ancestral_step,
+    offset_first_sigma_for_snr_const,
+    sigma_to_half_log_snr_const,
+    default_er_sde_noise_scaler,
     predict_denoised_const,
     run_step_callback,
     apply_inpaint_source,
+    _safe_signed_denom,
 )
 from ...pipelines.anima.image_processing import _ensure_finite
 
@@ -37,16 +39,36 @@ def sample_er_sde(
     inpaint_mask: torch.Tensor | None = None,
     init_image_latents: torch.Tensor | None = None,
     init_noise: torch.Tensor | None = None,
-    solver_type: str = "er_sde",
+    solver_type: str = "midpoint",
     max_stage: int = 3,
 ) -> torch.Tensor:
     if inpaint_mask is not None and (init_image_latents is None or init_noise is None):
-        raise ValueError("inpaint sampling requires both `init_image_latents` and `init_noise`.")
+        raise ValueError(
+            "inpaint sampling requires both `init_image_latents` and `init_noise`."
+        )
 
     sigmas = sanitize_sigmas(sigmas)
+    sigmas = offset_first_sigma_for_snr_const(sigmas)
+
     latents = latents.float()
     max_stage = max(1, min(int(max_stage), 3))
-    solver_type = str(solver_type).lower()
+    solver_type = str(solver_type).strip().lower()
+
+    deterministic = solver_type == "ode" or float(s_noise) <= 0.0
+
+    num_integration_points = 200.0
+    point_indices = torch.arange(
+        0,
+        num_integration_points,
+        dtype=torch.float32,
+        device=latents.device,
+    )
+
+    half_log_snrs = sigma_to_half_log_snr_const(sigmas)
+    er_lambdas = torch.exp(-half_log_snrs)  # sigma / alpha for CONST case
+
+    old_denoised: torch.Tensor | None = None
+    old_denoised_d: torch.Tensor | None = None
 
     _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
     for i in range(len(sigmas) - 1):
@@ -55,66 +77,71 @@ def sample_er_sde(
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
 
-        denoised = predict_denoised_const(
-            transformer,
-            latents,
-            sigma=sigma,
-            pos_cond=pos_cond,
-            neg_cond=neg_cond,
-            guidance_scale=guidance_scale,
-            cfg_batch_mode=cfg_batch_mode,
-            model_dtype=model_dtype,
-        )
+        denoised = model(latents, sigma)
+
+        stage_used = min(max_stage, i + 1)
 
         if sigma_next.item() == 0.0:
             latents = denoised
         else:
-            d0 = to_d(latents, sigma, denoised)
+            er_lambda_s = er_lambdas[i]
+            er_lambda_t = er_lambdas[i + 1]
 
-            if solver_type == "ode":
-                dt = (sigma_next - sigma).to(torch.float32)
-                while dt.ndim < latents.ndim:
-                    dt = dt.unsqueeze(-1)
-                x_pred = latents + d0 * dt
-            else:
-                sigma_down, sigma_up = get_ancestral_step(
-                    sigma,
-                    sigma_next,
-                    eta=1.0 if solver_type == "er_sde" else eta,
+            alpha_s = sigma.float() / er_lambda_s.clamp_min(1e-12)
+            alpha_t = sigma_next.float() / er_lambda_t.clamp_min(1e-12)
+
+            scaled_s = default_er_sde_noise_scaler(er_lambda_s).clamp_min(1e-12)
+            scaled_t = default_er_sde_noise_scaler(er_lambda_t).clamp_min(1e-12)
+
+            r_alpha = alpha_t / alpha_s.clamp_min(1e-12)
+            r = scaled_t / scaled_s
+
+            latents = (
+                r_alpha.to(latents.dtype) * r.to(latents.dtype) * latents
+                + alpha_t.to(latents.dtype) * (1.0 - r).to(latents.dtype) * denoised
+            )
+
+            if stage_used >= 2 and old_denoised is not None:
+                dt = er_lambda_t - er_lambda_s
+                lambda_step_size = -dt / num_integration_points
+                lambda_pos = er_lambda_t + point_indices * lambda_step_size
+                scaled_pos = default_er_sde_noise_scaler(lambda_pos).clamp_min(1e-12)
+
+                s = torch.sum(1.0 / scaled_pos) * lambda_step_size
+
+                prev_gap = _safe_signed_denom(er_lambda_s - er_lambdas[i - 1])
+                denoised_d = (denoised - old_denoised) / prev_gap
+
+                latents = latents + (
+                    alpha_t.to(latents.dtype)
+                    * (dt + s * scaled_t).to(latents.dtype)
+                    * denoised_d.to(latents.dtype)
                 )
-                dt = (sigma_down - sigma).to(torch.float32)
-                while dt.ndim < latents.ndim:
-                    dt = dt.unsqueeze(-1)
-                x_pred = latents + d0 * dt
 
-                if float(sigma_up.item()) > 0.0:
-                    noise = randn_like(latents, generator=generator).float()
-                    sigma_up_v = sigma_up.to(torch.float32)
-                    if solver_type == "reverse_time_sde":
-                        sigma_up_v = sigma_up_v ** (eta + 1.0)
-                    while sigma_up_v.ndim < latents.ndim:
-                        sigma_up_v = sigma_up_v.unsqueeze(-1)
-                    x_pred = x_pred + noise * s_noise * sigma_up_v
+                if stage_used >= 3 and old_denoised_d is not None and i >= 2:
+                    s_u = torch.sum((lambda_pos - er_lambda_s) / scaled_pos) * lambda_step_size
+                    prev2_gap = _safe_signed_denom((er_lambda_s - er_lambdas[i - 2]) / 2.0)
+                    denoised_u = (denoised_d - old_denoised_d) / prev2_gap
 
-            latents_new = x_pred
-            for _ in range(max_stage - 1):
-                den2 = predict_denoised_const(
-                    transformer,
-                    latents_new,
-                    sigma=sigma_next,
-                    pos_cond=pos_cond,
-                    neg_cond=neg_cond,
-                    guidance_scale=guidance_scale,
-                    cfg_batch_mode=cfg_batch_mode,
-                    model_dtype=model_dtype,
+                    latents = latents + (
+                        alpha_t.to(latents.dtype)
+                        * (((dt**2) / 2.0) + s_u * scaled_t).to(latents.dtype)
+                        * denoised_u.to(latents.dtype)
+                    )
+
+                old_denoised_d = denoised_d
+
+            if not deterministic:
+                noise = randn_like(latents, generator=generator).float()
+                noise_scale_sq = er_lambda_t**2 - er_lambda_s**2 * r**2
+                noise_scale = torch.sqrt(torch.clamp(noise_scale_sq, min=0.0))
+                latents = latents + (
+                    alpha_t.to(latents.dtype)
+                    * noise
+                    * float(s_noise)
+                    * noise_scale.to(latents.dtype)
                 )
-                d1 = to_d(latents_new, sigma_next, den2)
-                dt = (sigma_next - sigma).to(torch.float32)
-                while dt.ndim < latents.ndim:
-                    dt = dt.unsqueeze(-1)
-                latents_new = latents + 0.5 * (d0 + d1) * dt
 
-            latents = latents_new
             latents = apply_inpaint_source(
                 latents,
                 sigma_next=sigma_next,
@@ -123,7 +150,11 @@ def sample_er_sde(
                 init_noise=init_noise,
             )
 
-        _ensure_finite(latents, name="latents after ER-SDE step", runtime_dtype=torch.float32)
+        _ensure_finite(
+            latents,
+            name="latents after ER-SDE step",
+            runtime_dtype=torch.float32,
+        )
 
         latents = run_step_callback(
             pipeline,
@@ -133,5 +164,7 @@ def sample_er_sde(
             timestep=sigma,
             latents=latents,
         )
+
+        old_denoised = denoised
 
     return latents

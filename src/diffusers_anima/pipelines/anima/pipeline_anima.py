@@ -57,7 +57,13 @@ from .loading import (
 from .options import AnimaComponents, AnimaLoaderOptions
 from .pipeline_output import AnimaPipelineOutput
 from .prompt_utils import _resolve_prompt_batches
-from .sampling import GeneratorInput, randn_tensor, run_const_sigma_samplers, sample_flowmatch_euler
+from .sampling import (
+    GeneratorInput,
+    build_const_sampler_model,
+    randn_tensor,
+    run_const_sigma_samplers,
+    sample_flowmatch_euler,
+)
 from .sigma_schedules import build_sampling_sigmas
 from .strength_utils import (
     _trim_flowmatch_timesteps_by_strength,
@@ -463,59 +469,63 @@ def _generate_image(
                 neg_t5_weights=neg_t5_weights,
             )
 
-        if is_flowmatch:
-            if flowmatch_timesteps is None:
-                raise RuntimeError("Internal error: flowmatch timesteps were not initialized.")
+                if is_flowmatch:
+                    if flowmatch_timesteps is None:
+                        raise RuntimeError("Internal error: flowmatch timesteps were not initialized.")
 
-            latents = sample_flowmatch_euler(
-                pipe.transformer,
-                pipe.scheduler,
-                pipe,
-                latents,
-                timesteps=flowmatch_timesteps,
-                sigma_schedule=sigma_schedule,
-                pos_cond=pos_cond,
-                neg_cond=neg_cond,
-                guidance_scale=guidance_scale,
-                cfg_batch_mode=cfg_batch_mode,
-                model_dtype=pipe.model_dtype,
-                callback_on_step_end=callback_on_step_end,
-                callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
-                inpaint_mask=inpaint_mask,
-                init_image_latents=init_image_latents,
-                init_noise=init_noise,
-            )
-        else:
-            if sigmas is None:
-                raise RuntimeError("Internal error: sigma schedule was not initialized.")
+                    latents = sample_flowmatch_euler(
+                        pipe.transformer,
+                        pipe.scheduler,
+                        pipe,
+                        latents,
+                        timesteps=flowmatch_timesteps,
+                        sigma_schedule=sigma_schedule,
+                        pos_cond=pos_cond,
+                        neg_cond=neg_cond,
+                        guidance_scale=guidance_scale,
+                        cfg_batch_mode=cfg_batch_mode,
+                        model_dtype=pipe.model_dtype,
+                        callback_on_step_end=callback_on_step_end,
+                        callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
+                        inpaint_mask=inpaint_mask,
+                        init_image_latents=init_image_latents,
+                        init_noise=init_noise,
+                    )
+                else:
+                    if sigmas is None:
+                        raise RuntimeError("Internal error: sigma schedule was not initialized.")
 
-            latents = run_const_sigma_samplers(
-                pipe.transformer,
-                pipe,
-                latents,
-                sigmas=sigmas,
-                sampler=sampler,
-                pos_cond=pos_cond,
-                neg_cond=neg_cond,
-                guidance_scale=guidance_scale,
-                eta=eta,
-                s_noise=s_noise,
-                generator=step_generator,
-                cfg_batch_mode=cfg_batch_mode,
-                model_dtype=pipe.model_dtype,
-                callback_on_step_end=callback_on_step_end,
-                callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
-                input_is_noisy_latents=input_is_noisy_latents,
-                inpaint_mask=inpaint_mask,
-                init_image_latents=init_image_latents,
-                init_noise=init_noise,
-                solver_type=solver_type,
-                max_stage=max_stage,
-                s_churn=s_churn,
-                s_tmin=s_tmin,
-                s_tmax=s_tmax,
-            )
+                    const_model = build_const_sampler_model(
+                        pipe.transformer,
+                        pos_cond=pos_cond,
+                        neg_cond=neg_cond,
+                        guidance_scale=guidance_scale,
+                        cfg_batch_mode=cfg_batch_mode,
+                        model_dtype=pipe.model_dtype,
+                    )
 
+                    latents = run_const_sigma_samplers(
+                        const_model,
+                        pipe,
+                        latents,
+                        sigmas=sigmas,
+                        sampler=sampler,
+                        eta=eta,
+                        s_noise=s_noise,
+                        generator=step_generator,
+                        callback_on_step_end=callback_on_step_end,
+                        callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
+                        input_is_noisy_latents=input_is_noisy_latents,
+                        inpaint_mask=inpaint_mask,
+                        init_image_latents=init_image_latents,
+                        init_noise=init_noise,
+                        solver_type=solver_type,
+                        max_stage=max_stage,
+                        s_churn=s_churn,
+                        s_tmin=s_tmin,
+                        s_tmax=s_tmax,
+                    )
+                    
     if output_type == "latent":
         return latents
 
