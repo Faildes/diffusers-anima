@@ -5,14 +5,18 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AnimaComponents:
-    """Sources for an Anima single-file load.
+    """Sources for Anima single-file style loading.
 
-    All auxiliary-component sources (text encoder, VAE, tokenizers) are
-    resolved inside ``loading.py`` using the hardcoded Anima defaults.
-    Only the transformer checkpoint path is caller-supplied.
+    ``model_path`` is the transformer checkpoint. ``text_encoder_path`` and
+    ``vae_path`` are optional override files used by
+    ``AnimaPipeline.from_multiple_files``. When they are omitted, loading.py
+    falls back to the hardcoded Anima defaults used by ``from_single_file``.
+    Tokenizers are still resolved from the fixed Anima tokenizer sources.
     """
 
     model_path: str
+    text_encoder_path: str | None = None
+    vae_path: str | None = None
 
 
 @dataclass(frozen=True)

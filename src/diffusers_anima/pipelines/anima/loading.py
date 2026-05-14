@@ -36,9 +36,9 @@ from .text_encoding import AnimaPromptTokenizer
 from .vae_conversion import convert_anima_vae_state_dict
 
 # ---------------------------------------------------------------------------
-# Internal component sources for from_single_file
-# These are fixed to the Anima model architecture and not user-configurable.
-# To use different components, build the pipeline manually.
+# Default component sources for from_single_file
+# from_multiple_files can override the text encoder and VAE file sources while
+# keeping the same tokenizer defaults.
 # ---------------------------------------------------------------------------
 _ANIMA_REPO = "hdae/diffusers-anima-preview"
 _TEXT_ENCODER_WEIGHTS = f"{_ANIMA_REPO}::text_encoder/model.safetensors"
@@ -446,17 +446,12 @@ def load_vae_single_file(
     return vae
 
 
-def load_text_encoder(
-    *,
-    device: str,
-    dtype: torch.dtype,
-    options: AnimaLoaderOptions,
+def load_text_encoder_single_file(
+    file_path: str, *, device: str, dtype: torch.dtype
 ) -> Qwen3Model:
-    file_path = resolve_split_file_path(
-        _TEXT_ENCODER_WEIGHTS,
-        options=options,
-        component_name="text_encoder",
-    )
+    if not Path(file_path).exists():
+        raise FileNotFoundError(f"Anima text encoder checkpoint not found: {file_path}")
+
     state_dict = load_file(file_path, device="cpu")
     state_dict = _strip_model_prefix(state_dict)
 
@@ -476,15 +471,35 @@ def load_text_encoder(
     return text_encoder
 
 
+def load_text_encoder(
+    *,
+    device: str,
+    dtype: torch.dtype,
+    options: AnimaLoaderOptions,
+    source: str = _TEXT_ENCODER_WEIGHTS,
+    allow_remote_url: bool = False,
+) -> Qwen3Model:
+    file_path = resolve_single_file_path(
+        source,
+        options=options,
+        input_label="text_encoder",
+        allow_remote_url=allow_remote_url,
+    )
+    return load_text_encoder_single_file(file_path, device=device, dtype=dtype)
+
+
 def load_vae(
     device: str,
     dtype: torch.dtype,
     options: AnimaLoaderOptions,
+    source: str = _VAE_SOURCE,
+    allow_remote_url: bool = False,
 ) -> AutoencoderKLQwenImage:
-    file_path = resolve_split_file_path(
-        _VAE_SOURCE,
+    file_path = resolve_single_file_path(
+        source,
         options=options,
-        component_name="vae",
+        input_label="vae",
+        allow_remote_url=allow_remote_url,
     )
     return load_vae_single_file(file_path, device=device, dtype=dtype)
 
@@ -646,10 +661,12 @@ def build_anima_pipeline(
     proxies: dict[str, str] | None = None,
     scheduler: FlowMatchEulerDiscreteScheduler | None = None,
 ) -> "AnimaPipeline":
-    """Construct an ``AnimaPipeline`` from a raw transformer checkpoint.
+    """Construct an ``AnimaPipeline`` from raw single-file style components.
 
-    Used by ``AnimaPipeline.from_single_file``. All auxiliary components
-    (text encoder, VAE, tokenizers) are loaded from fixed Anima sources.
+    Used by ``AnimaPipeline.from_single_file`` and
+    ``AnimaPipeline.from_multiple_files``. If ``components`` does not provide
+    text encoder or VAE paths, those auxiliary components are loaded from the
+    fixed Anima defaults.
     """
     # Import here to avoid circular imports.
     from .pipeline_anima import AnimaPipeline
@@ -686,11 +703,15 @@ def build_anima_pipeline(
         device=load_device,
         dtype=resolved_dtype,
         options=load_options,
+        source=components.vae_path or _VAE_SOURCE,
+        allow_remote_url=components.vae_path is not None,
     )
     text_encoder = load_text_encoder(
         device=load_device,
         dtype=resolved_text_encoder_dtype,
         options=load_options,
+        source=components.text_encoder_path or _TEXT_ENCODER_WEIGHTS,
+        allow_remote_url=components.text_encoder_path is not None,
     )
     prompt_tokenizer = load_prompt_tokenizer(
         qwen_tokenizer_source=_QWEN_TOKENIZER_SOURCE,

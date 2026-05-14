@@ -1033,29 +1033,29 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         return loaded
 
     @classmethod
-    def _from_single_file_source(
+    def _from_components_source(
         cls,
-        pretrained_model_name_or_path: str,
+        components: AnimaComponents,
         *,
         kwargs: dict[str, Any],
+        api_name: str,
     ) -> "AnimaPipeline":
         ignored, unknown = _partition_single_file_from_pretrained_kwargs(kwargs)
         for key in ignored:
             kwargs.pop(key, None)
         if ignored:
             warnings.warn(
-                "Ignoring unsupported from_pretrained arguments for Anima single-file loading: "
+                f"Ignoring unsupported {api_name} arguments for Anima single-file loading: "
                 + ", ".join(ignored),
                 stacklevel=2,
             )
 
-        components = AnimaComponents(model_path=str(pretrained_model_name_or_path))
         scheduler = scheduler_from_kwargs(kwargs, consume=False)
         runtime_options = runtime_options_from_kwargs(kwargs, consume=False)
         load_options = loader_options_from_kwargs(kwargs, consume=False)
         if unknown:
             raise ValueError(
-                f"Unsupported arguments for AnimaPipeline.from_single_file: {', '.join(unknown)}"
+                f"Unsupported arguments for AnimaPipeline.{api_name}: {', '.join(unknown)}"
             )
 
         runtime = build_anima_pipeline(
@@ -1072,6 +1072,38 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             scheduler=scheduler,
         )
         return runtime
+
+    @classmethod
+    def _from_single_file_source(
+        cls,
+        pretrained_model_name_or_path: str,
+        *,
+        kwargs: dict[str, Any],
+    ) -> "AnimaPipeline":
+        return cls._from_components_source(
+            AnimaComponents(model_path=str(pretrained_model_name_or_path)),
+            kwargs=kwargs,
+            api_name="from_single_file",
+        )
+
+    @classmethod
+    def _from_multiple_file_sources(
+        cls,
+        model_path: str,
+        encoder_path: str,
+        vae_path: str,
+        *,
+        kwargs: dict[str, Any],
+    ) -> "AnimaPipeline":
+        return cls._from_components_source(
+            AnimaComponents(
+                model_path=str(model_path),
+                text_encoder_path=str(encoder_path),
+                vae_path=str(vae_path),
+            ),
+            kwargs=kwargs,
+            api_name="from_multiple_files",
+        )
 
     @classmethod
     def from_pretrained(
@@ -1133,5 +1165,36 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         )
         return cls._from_single_file_source(
             pretrained_model_link_or_path,
+            kwargs=kwargs,
+        )
+
+    @classmethod
+    def from_multiple_files(
+        cls,
+        model_path: str,
+        encoder_path: str,
+        vae_path: str,
+        **kwargs: Any,
+    ) -> "AnimaPipeline":
+        """Load Anima from separate transformer, text encoder, and VAE files.
+
+        ``model_path`` points to the Anima transformer checkpoint,
+        ``encoder_path`` points to the Qwen3-0.6B text encoder checkpoint, and
+        ``vae_path`` points to the Anima VAE checkpoint. Each path accepts the
+        same source forms as ``from_single_file``: a local file,
+        ``repo_id::filename``, or a Hugging Face file URL.
+        """
+        _raise_if_removed_from_pretrained_runtime_feature_kwargs(
+            kwargs, api_name="from_multiple_files"
+        )
+        _pop_ignored_kwargs(
+            kwargs,
+            ignored_keys=_DIFFUSERS_COMPAT_IGNORED_FROM_SINGLE_FILE_KEYS,
+            api_name="from_multiple_files",
+        )
+        return cls._from_multiple_file_sources(
+            model_path,
+            encoder_path,
+            vae_path,
             kwargs=kwargs,
         )
