@@ -27,6 +27,8 @@ class AnimaLoaderOptions:
     token: str | bool | None = None
     revision: str | None = None
     proxies: dict[str, str] | None = None
+    cache_components: bool = True
+    cache_transformer: bool = False
 
 
 @dataclass(frozen=True)

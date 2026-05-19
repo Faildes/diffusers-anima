@@ -74,32 +74,67 @@ def randn_like(
     )
 
 
+def _resolve_cfg_batch_mode(cfg_batch_mode: str, *, device_type: str) -> str:
+    if cfg_batch_mode == "auto":
+        return "concat" if device_type == "cuda" else "split"
+    return cfg_batch_mode
+
+
 def _predict_noise_cfg(
     transformer: "ModelMixin",
     latents: torch.Tensor,
     *,
     model_timestep: torch.Tensor,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
 ) -> torch.Tensor:
-    model_input = latents.to(dtype=model_dtype)
+    model_input = latents if latents.dtype == model_dtype else latents.to(dtype=model_dtype)
     timestep = model_timestep.to(device=model_input.device, dtype=torch.float32)
     if timestep.ndim == 0:
         timestep = timestep.expand(model_input.shape[0])
 
-    if cfg_batch_mode == "concat":
+    resolved_cfg_batch_mode = _resolve_cfg_batch_mode(
+        cfg_batch_mode, device_type=model_input.device.type
+    )
+
+    # Diffusers does not run the unconditional branch when guidance is disabled.
+    # This avoids the negative text-encoder path and one or two extra tensor
+    # conversions for guidance_scale <= 1.0.
+    if neg_cond is None and guidance_scale <= 1.0:
+        with torch.inference_mode():
+            noise = transformer(
+                model_input,
+                timestep,
+                encoder_hidden_states=pos_cond.to(
+                    device=model_input.device, dtype=model_dtype
+                ),
+                return_dict=False,
+            )[0]
+        if check_finite and model_dtype == torch.float16:
+            _ensure_finite(noise, name="noise prediction", runtime_dtype=model_dtype)
+        return noise.to(dtype=latents.dtype)
+
+    if resolved_cfg_batch_mode == "concat":
         model_input = torch.cat([model_input, model_input], dim=0)
         timestep = torch.cat([timestep, timestep], dim=0)
-        encoder_hidden_states = torch.cat(
-            [
-                pos_cond.to(device=model_input.device, dtype=model_dtype),
-                neg_cond.to(device=model_input.device, dtype=model_dtype),
-            ],
-            dim=0,
-        )
+        if neg_cond is None:
+            # ``pos_cond`` may already be the pre-concatenated [positive, negative]
+            # conditioning tensor prepared once by the pipeline.
+            encoder_hidden_states = pos_cond.to(
+                device=model_input.device, dtype=model_dtype
+            )
+        else:
+            encoder_hidden_states = torch.cat(
+                [
+                    pos_cond.to(device=model_input.device, dtype=model_dtype),
+                    neg_cond.to(device=model_input.device, dtype=model_dtype),
+                ],
+                dim=0,
+            )
         with torch.inference_mode():
             noise_pred = transformer(
                 model_input,
@@ -108,29 +143,31 @@ def _predict_noise_cfg(
                 return_dict=False,
             )[0]
         noise_pred_text, noise_pred_uncond = noise_pred.chunk(2, dim=0)
-    elif cfg_batch_mode == "split":
+    elif resolved_cfg_batch_mode == "split":
+        if neg_cond is None:
+            raise ValueError("`neg_cond` is required when cfg_batch_mode='split'.")
+        pos_cond = pos_cond.to(device=model_input.device, dtype=model_dtype)
+        neg_cond = neg_cond.to(device=model_input.device, dtype=model_dtype)
         with torch.inference_mode():
             noise_pred_uncond = transformer(
                 model_input,
                 timestep,
-                encoder_hidden_states=neg_cond.to(device=model_input.device, dtype=model_dtype),
+                encoder_hidden_states=neg_cond,
                 return_dict=False,
             )[0]
             noise_pred_text = transformer(
                 model_input,
                 timestep,
-                encoder_hidden_states=pos_cond.to(device=model_input.device, dtype=model_dtype),
+                encoder_hidden_states=pos_cond,
                 return_dict=False,
             )[0]
     else:
-        raise ValueError("cfg_batch_mode must be one of: split, concat.")
+        raise ValueError("cfg_batch_mode must be one of: auto, split, concat.")
 
-    noise = (
-        noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-    ).float()
-    if model_dtype == torch.float16:
+    noise = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+    if check_finite and model_dtype == torch.float16:
         _ensure_finite(noise, name="noise prediction", runtime_dtype=model_dtype)
-    return noise
+    return noise.to(dtype=latents.dtype)
 
 
 def _predict_denoised_const(
@@ -139,10 +176,11 @@ def _predict_denoised_const(
     *,
     sigma: torch.Tensor,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
 ) -> torch.Tensor:
     model_timestep = (
         (sigma * ANIMA_SAMPLING_MULTIPLIER).expand(latents.shape[0]).float()
@@ -156,8 +194,9 @@ def _predict_denoised_const(
         guidance_scale=guidance_scale,
         cfg_batch_mode=cfg_batch_mode,
         model_dtype=model_dtype,
+        check_finite=check_finite,
     )
-    return latents - sigma.float() * noise_pred
+    return latents - sigma.to(latents.dtype) * noise_pred
 
 
 def _run_step_callback(
@@ -194,10 +233,11 @@ def sample_euler(
     *,
     sigmas: torch.Tensor,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     inpaint_mask: torch.Tensor | None = None,
@@ -224,8 +264,9 @@ def sample_euler(
             guidance_scale=guidance_scale,
             cfg_batch_mode=cfg_batch_mode,
             model_dtype=model_dtype,
+            check_finite=check_finite,
         )
-        if sigma_next.item() == 0.0:
+        if i == len(sigmas) - 2:
             latents = denoised
             latents = _run_step_callback(
                 pipeline,
@@ -269,13 +310,14 @@ def sample_euler_ancestral_rf(
     *,
     sigmas: torch.Tensor,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     eta: float,
     s_noise: float,
     generator: torch.Generator | list[torch.Generator] | None,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     inpaint_mask: torch.Tensor | None = None,
@@ -302,8 +344,9 @@ def sample_euler_ancestral_rf(
             guidance_scale=guidance_scale,
             cfg_batch_mode=cfg_batch_mode,
             model_dtype=model_dtype,
+            check_finite=check_finite,
         )
-        if sigma_next.item() == 0.0:
+        if i == len(sigmas) - 2:
             latents = denoised
             latents = _run_step_callback(
                 pipeline,
@@ -363,10 +406,11 @@ def sample_flowmatch_euler(
     timesteps: torch.Tensor,
     sigma_schedule: str,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     inpaint_mask: torch.Tensor | None = None,
@@ -399,6 +443,7 @@ def sample_flowmatch_euler(
             guidance_scale=guidance_scale,
             cfg_batch_mode=cfg_batch_mode,
             model_dtype=model_dtype,
+            check_finite=check_finite,
         )
 
         latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
@@ -440,13 +485,14 @@ def run_const_sigma_samplers(
     sigmas: torch.Tensor,
     sampler: str,
     pos_cond: torch.Tensor,
-    neg_cond: torch.Tensor,
+    neg_cond: torch.Tensor | None,
     guidance_scale: float,
     eta: float,
     s_noise: float,
     generator: torch.Generator | list[torch.Generator] | None,
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
+    check_finite: bool = False,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     input_is_noisy_latents: bool = False,
@@ -471,6 +517,7 @@ def run_const_sigma_samplers(
             guidance_scale=guidance_scale,
             cfg_batch_mode=cfg_batch_mode,
             model_dtype=model_dtype,
+            check_finite=check_finite,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             inpaint_mask=inpaint_mask,
@@ -492,6 +539,7 @@ def run_const_sigma_samplers(
             generator=generator,
             cfg_batch_mode=cfg_batch_mode,
             model_dtype=model_dtype,
+            check_finite=check_finite,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             inpaint_mask=inpaint_mask,

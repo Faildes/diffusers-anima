@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -46,6 +47,46 @@ _TEXT_ENCODER_CONFIG_REPO = "Qwen/Qwen3-0.6B-Base"
 _QWEN_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_qwen"
 _T5_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_t5"
 _VAE_SOURCE = f"{_ANIMA_REPO}::vae/diffusion_pytorch_model.safetensors"
+
+
+# ---------------------------------------------------------------------------
+# In-process reload cache
+# ---------------------------------------------------------------------------
+# from_multiple_files/from_single_file are raw single-file style loaders. Unlike
+# Diffusers-format from_pretrained, they must instantiate modules and convert
+# checkpoint keys every time. These caches avoid repeating that work when the
+# same Python process reloads the same component sources.
+_COMPONENT_CACHE_MAX_ITEMS = 8
+_TOKENIZER_CACHE_MAX_ITEMS = 4
+_COMPONENT_CACHE: "OrderedDict[tuple[Any, ...], torch.nn.Module]" = OrderedDict()
+_TOKENIZER_CACHE: "OrderedDict[tuple[Any, ...], AnimaPromptTokenizer]" = OrderedDict()
+
+
+def _path_signature(file_path: str) -> tuple[str, int, int]:
+    path = Path(file_path).expanduser().resolve()
+    stat = path.stat()
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _cache_get(cache: OrderedDict, key: tuple[Any, ...]) -> Any | None:
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+
+def _cache_put(cache: OrderedDict, key: tuple[Any, ...], value: Any, *, max_items: int) -> Any:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_items:
+        cache.popitem(last=False)
+    return value
+
+
+def clear_anima_component_cache() -> None:
+    """Clear the in-process component/tokenizer cache used by raw-file loaders."""
+    _COMPONENT_CACHE.clear()
+    _TOKENIZER_CACHE.clear()
 
 
 def coerce_anima_scheduler(
@@ -147,6 +188,8 @@ def loader_options_from_kwargs(
         token=get_value("token", None),
         revision=str(revision) if revision is not None else None,
         proxies=normalize_proxies(get_value("proxies", None)),
+        cache_components=bool(get_value("cache_components", True)),
+        cache_transformer=bool(get_value("cache_transformer", False)),
     )
 
 
@@ -327,12 +370,34 @@ def load_prompt_tokenizer(
     t5_tokenizer_source: str,
     options: AnimaLoaderOptions,
 ) -> AnimaPromptTokenizer:
+    cache_key = (
+        "prompt_tokenizer",
+        qwen_tokenizer_source,
+        t5_tokenizer_source,
+        options.local_files_only,
+        options.cache_dir,
+        options.revision,
+        bool(options.token),
+    )
+    if options.cache_components and not options.force_download:
+        cached = _cache_get(_TOKENIZER_CACHE, cache_key)
+        if cached is not None:
+            return cached
+
     qwen_tokenizer = load_tokenizer_from_source(qwen_tokenizer_source, options=options)
     t5_tokenizer = load_tokenizer_from_source(t5_tokenizer_source, options=options)
-    return AnimaPromptTokenizer(
+    tokenizer = AnimaPromptTokenizer(
         qwen_tokenizer=qwen_tokenizer,
         t5_tokenizer=t5_tokenizer,
     )
+    if options.cache_components and not options.force_download:
+        _cache_put(
+            _TOKENIZER_CACHE,
+            cache_key,
+            tokenizer,
+            max_items=_TOKENIZER_CACHE_MAX_ITEMS,
+        )
+    return tokenizer
 
 
 def save_prompt_tokenizers_to_local_dir(
@@ -428,8 +493,20 @@ def _strip_wrapping_prefixes(
 
 
 def load_vae_single_file(
-    file_path: str, device: str, dtype: torch.dtype
+    file_path: str,
+    device: str,
+    dtype: torch.dtype,
+    *,
+    cache: bool = False,
 ) -> AutoencoderKLQwenImage:
+    cache_key = ("vae", _path_signature(file_path), str(device), dtype)
+    if cache:
+        cached = _cache_get(_COMPONENT_CACHE, cache_key)
+        if cached is not None:
+            cached.eval().requires_grad_(False)
+            cached.to(device=device, dtype=dtype)
+            return cached  # type: ignore[return-value]
+
     state_dict = load_file(file_path, device="cpu")
     state_dict = convert_anima_vae_state_dict(state_dict)
 
@@ -440,17 +517,32 @@ def load_vae_single_file(
             "Single-file VAE does not match expected AutoencoderKLQwenImage architecture. "
             f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
         )
+    del state_dict
     vae.to(dtype=dtype)
     vae.eval().requires_grad_(False)
     vae.to(device)
+    if cache:
+        _cache_put(_COMPONENT_CACHE, cache_key, vae, max_items=_COMPONENT_CACHE_MAX_ITEMS)
     return vae
 
 
 def load_text_encoder_single_file(
-    file_path: str, *, device: str, dtype: torch.dtype
+    file_path: str,
+    *,
+    device: str,
+    dtype: torch.dtype,
+    cache: bool = False,
 ) -> Qwen3Model:
     if not Path(file_path).exists():
         raise FileNotFoundError(f"Anima text encoder checkpoint not found: {file_path}")
+
+    cache_key = ("text_encoder", _path_signature(file_path), str(device), dtype)
+    if cache:
+        cached = _cache_get(_COMPONENT_CACHE, cache_key)
+        if cached is not None:
+            cached.eval().requires_grad_(False)
+            cached.to(device=device, dtype=dtype)
+            return cached  # type: ignore[return-value]
 
     state_dict = load_file(file_path, device="cpu")
     state_dict = _strip_model_prefix(state_dict)
@@ -464,10 +556,13 @@ def load_text_encoder_single_file(
             "Text encoder weights do not match expected Qwen3-0.6B architecture. "
             f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
         )
+    del state_dict
 
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)
     text_encoder.to(device=device, dtype=dtype)
+    if cache:
+        _cache_put(_COMPONENT_CACHE, cache_key, text_encoder, max_items=_COMPONENT_CACHE_MAX_ITEMS)
     return text_encoder
 
 
@@ -485,7 +580,12 @@ def load_text_encoder(
         input_label="text_encoder",
         allow_remote_url=allow_remote_url,
     )
-    return load_text_encoder_single_file(file_path, device=device, dtype=dtype)
+    return load_text_encoder_single_file(
+        file_path,
+        device=device,
+        dtype=dtype,
+        cache=options.cache_components and not options.force_download,
+    )
 
 
 def load_vae(
@@ -501,20 +601,38 @@ def load_vae(
         input_label="vae",
         allow_remote_url=allow_remote_url,
     )
-    return load_vae_single_file(file_path, device=device, dtype=dtype)
+    return load_vae_single_file(
+        file_path,
+        device=device,
+        dtype=dtype,
+        cache=options.cache_components and not options.force_download,
+    )
 
 
 def load_transformer_native(
-    model_path: str, device: str, dtype: torch.dtype
+    model_path: str,
+    device: str,
+    dtype: torch.dtype,
+    *,
+    cache: bool = False,
 ) -> AnimaTransformerModel:
     if not Path(model_path).exists():
         raise FileNotFoundError(f"Anima checkpoint not found: {model_path}")
+
+    cache_key = ("transformer", _path_signature(model_path), str(device), dtype)
+    if cache:
+        cached = _cache_get(_COMPONENT_CACHE, cache_key)
+        if cached is not None:
+            cached.eval().requires_grad_(False)
+            cached.to(device=device, dtype=dtype)
+            return cached  # type: ignore[return-value]
 
     state_dict = load_file(model_path, device="cpu")
     state_dict = _strip_wrapping_prefixes(state_dict)
     core_state_dict, llm_adapter_state_dict = _convert_anima_state_dict_to_diffusers(
         state_dict
     )
+    del state_dict
 
     transformer = AnimaTransformerModel()
     merged_state = {**core_state_dict, **llm_adapter_state_dict}
@@ -525,10 +643,13 @@ def load_transformer_native(
             "Anima checkpoint does not match native transformer architecture. "
             f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
         )
+    del merged_state, core_state_dict, llm_adapter_state_dict
 
     transformer.to(dtype=dtype)
     transformer.eval().requires_grad_(False)
     transformer.to(device=device, dtype=dtype)
+    if cache:
+        _cache_put(_COMPONENT_CACHE, cache_key, transformer, max_items=_COMPONENT_CACHE_MAX_ITEMS)
     return transformer
 
 
@@ -698,6 +819,11 @@ def build_anima_pipeline(
         model_path=resolved_model_path,
         device=load_device,
         dtype=resolved_dtype,
+        cache=(
+            load_options.cache_components
+            and load_options.cache_transformer
+            and not load_options.force_download
+        ),
     )
     vae = load_vae(
         device=load_device,

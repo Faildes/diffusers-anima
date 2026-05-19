@@ -27,7 +27,7 @@ _SUPPORTED_SAMPLERS = set(AnimaFlowMatchEulerDiscreteScheduler.SUPPORTED_SAMPLER
 _SUPPORTED_SIGMA_SCHEDULES = set(
     AnimaFlowMatchEulerDiscreteScheduler.SUPPORTED_SIGMA_SCHEDULES
 )
-_SUPPORTED_CFG_BATCH_MODES = {"split", "concat"}
+_SUPPORTED_CFG_BATCH_MODES = {"auto", "split", "concat"}
 _SUPPORTED_OUTPUT_TYPES = {"pil", "np", "latent"}
 _DIFFUSERS_COMPAT_IGNORED_SINGLE_FILE_FROM_PRETRAINED_KEYS = {
     "custom_pipeline",
@@ -81,6 +81,8 @@ _ANIMA_LOADER_OPTION_KEYS = {
     "token",
     "revision",
     "proxies",
+    "cache_components",
+    "cache_transformer",
 }
 _ANIMA_COMPONENT_INSTANCE_KEYS = {"scheduler"}
 _ANIMA_SINGLE_FILE_FROM_PRETRAINED_KEYS = (
@@ -137,7 +139,7 @@ def _validate_sampling_modes(
 ) -> None:
     _validate_sampler_schedule(sampler=sampler, sigma_schedule=sigma_schedule)
     if cfg_batch_mode not in _SUPPORTED_CFG_BATCH_MODES:
-        raise ValueError("`cfg_batch_mode` must be one of: split, concat.")
+        raise ValueError("`cfg_batch_mode` must be one of: auto, split, concat.")
     if output_type not in _SUPPORTED_OUTPUT_TYPES:
         raise ValueError("`output_type` must be one of: pil, np, latent.")
 

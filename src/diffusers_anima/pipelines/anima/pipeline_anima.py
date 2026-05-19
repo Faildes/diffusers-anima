@@ -22,6 +22,7 @@ from ...loaders.lora_pipeline import AnimaLoraLoaderMixin
 from ...models.transformers.modeling_anima_transformer import AnimaTransformerModel
 from ...schedulers import AnimaFlowMatchEulerDiscreteScheduler, AnimaSamplingConfig
 from .constants import (
+    DTYPE_MAP,
     FORGE_BETA_ALPHA,
     FORGE_BETA_BETA,
 )
@@ -39,6 +40,7 @@ from .image_processing import (
 )
 from .loading import (
     build_anima_pipeline,
+    clear_anima_component_cache,
     coerce_anima_scheduler,
     load_prompt_tokenizer,
     loader_options_from_kwargs,
@@ -104,6 +106,45 @@ def _module_execution_context(
     yield
 
 
+def _resolve_sample_dtype(
+    sample_dtype: str | torch.dtype,
+    *,
+    model_dtype: torch.dtype,
+    execution_device: str,
+) -> torch.dtype:
+    """Resolve the denoising latent dtype.
+
+    Diffusers-style pipelines usually keep latents in the inference/model dtype on
+    CUDA. The previous Anima path always used float32 latents, forcing a cast into
+    ``model_dtype`` at every transformer step and then promoting the result back
+    to float32. ``auto`` keeps the older stable float32 path on CPU, but uses the
+    model dtype on CUDA/MPS when it is a common inference dtype.
+    """
+    if isinstance(sample_dtype, torch.dtype):
+        return sample_dtype
+    if not isinstance(sample_dtype, str):
+        raise ValueError("`sample_dtype` must be 'auto', a dtype name, or torch.dtype.")
+    mapped = DTYPE_MAP.get(sample_dtype)
+    if sample_dtype != "auto" and mapped is None:
+        raise ValueError(f"Unsupported sample_dtype: {sample_dtype}")
+    if mapped is not None:
+        return mapped
+    if execution_device in {"cuda", "mps"} and model_dtype in {
+        torch.float16,
+        torch.bfloat16,
+    }:
+        return model_dtype
+    return torch.float32
+
+
+def _resolve_effective_cfg_batch_mode(cfg_batch_mode: str, *, execution_device: str) -> str:
+    """Resolve ``cfg_batch_mode='auto'`` to a concrete execution strategy."""
+    if cfg_batch_mode == "auto":
+        # CUDA benefits most from the Diffusers-style batched CFG forward. CPU/MPS
+        # often prefer lower peak memory and avoid the doubled batch.
+        return "concat" if execution_device == "cuda" else "split"
+    return cfg_batch_mode
+
 
 # ---------------------------------------------------------------------------
 # Internal image generation routine
@@ -114,9 +155,14 @@ def _prepare_prompt_embedding_inputs(
     pipe: "AnimaPipeline",
     *,
     prompt: list[str],
-    negative_prompt: list[str],
+    negative_prompt: list[str] | None,
 ) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     with _module_execution_context(
         pipe.text_encoder,
@@ -127,8 +173,8 @@ def _prepare_prompt_embedding_inputs(
         if pipe.prompt_tokenizer is None:
             raise RuntimeError(
                 "AnimaPipeline requires a prompt_tokenizer. "
-                "Load the pipeline via from_pretrained or from_single_file to ensure "
-                "the tokenizer is initialised automatically."
+                "Load the pipeline via from_pretrained, from_single_file, or "
+                "from_multiple_files to ensure the tokenizer is initialised automatically."
             )
         pos_hidden, pos_t5_ids, pos_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
@@ -137,6 +183,8 @@ def _prepare_prompt_embedding_inputs(
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
         )
+        if negative_prompt is None:
+            return pos_hidden, pos_t5_ids, pos_t5_weights, None, None, None
         neg_hidden, neg_t5_ids, neg_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
             pipe.text_encoder,
@@ -161,16 +209,18 @@ def _build_cfg_conditions_from_embeddings(
     pos_hidden: torch.Tensor,
     pos_t5_ids: torch.Tensor,
     pos_t5_weights: torch.Tensor,
-    neg_hidden: torch.Tensor,
-    neg_t5_ids: torch.Tensor,
-    neg_t5_weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    neg_hidden: torch.Tensor | None,
+    neg_t5_ids: torch.Tensor | None,
+    neg_t5_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     pos_cond = build_condition(
         pipe.transformer,
         qwen_hidden=pos_hidden,
         t5_ids=pos_t5_ids,
         t5_weights=pos_t5_weights,
     )
+    if neg_hidden is None or neg_t5_ids is None or neg_t5_weights is None:
+        return pos_cond, None
     neg_cond = build_condition(
         pipe.transformer,
         qwen_hidden=neg_hidden,
@@ -277,7 +327,9 @@ def _generate_image(
     beta_beta: float = FORGE_BETA_BETA,
     eta: float = 1.0,
     s_noise: float = 1.0,
-    cfg_batch_mode: str = "split",
+    cfg_batch_mode: str = "auto",
+    sample_dtype: str | torch.dtype = "auto",
+    check_finite: bool = False,
     output_type: str = "pil",
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None = None,
     callback_on_step_end_tensor_inputs: list[str] | None = None,
@@ -285,6 +337,10 @@ def _generate_image(
     """Internal end-to-end generation routine used by ``AnimaPipeline.__call__``."""
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be >= 1")
+    use_cfg = guidance_scale > 1.0
+    effective_cfg_batch_mode = _resolve_effective_cfg_batch_mode(
+        cfg_batch_mode, execution_device=pipe.execution_device
+    )
     if prompt_embeds is not None:
         batch_size = prompt_embeds.shape[0]
         pos_hidden = pos_t5_ids = pos_t5_weights = None
@@ -300,7 +356,7 @@ def _generate_image(
             _prepare_prompt_embedding_inputs(
                 pipe,
                 prompt=prompts,
-                negative_prompt=negative_prompts,
+                negative_prompt=negative_prompts if use_cfg else None,
             )
         )
 
@@ -310,7 +366,11 @@ def _generate_image(
         vae_scale_factor=pipe.vae_scale_factor,
         patch_size=pipe.patch_size,
     )
-    sample_dtype = torch.float32
+    resolved_sample_dtype = _resolve_sample_dtype(
+        sample_dtype,
+        model_dtype=pipe.model_dtype,
+        execution_device=pipe.execution_device,
+    )
 
     resolved_callback_tensor_inputs = callback_on_step_end_tensor_inputs or ["latents"]
     init_generator, step_generator, noise_device, noise_dtype = _resolve_noise_runtime(
@@ -333,7 +393,7 @@ def _generate_image(
         latent_w=latent_w,
         batch_size=batch_size,
         init_generator=init_generator,
-        sample_dtype=sample_dtype,
+        sample_dtype=resolved_sample_dtype,
     )
 
     flowmatch_timesteps: torch.Tensor | None = None
@@ -353,7 +413,7 @@ def _generate_image(
                 dtype=noise_dtype,
                 generator=init_generator,
             )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+            latents = latents.to(device=pipe.execution_device, dtype=resolved_sample_dtype)
         else:
             init_image_latents = align_tensor_batch_size(
                 init_image_latents,
@@ -365,7 +425,7 @@ def _generate_image(
                 device=noise_device,
                 dtype=noise_dtype,
                 generator=init_generator,
-            ).to(device=pipe.execution_device, dtype=sample_dtype)
+            ).to(device=pipe.execution_device, dtype=resolved_sample_dtype)
             start_timestep = (
                 flowmatch_timesteps[:1]
                 .expand(init_image_latents.shape[0])
@@ -377,7 +437,7 @@ def _generate_image(
             latents = pipe.scheduler.scale_noise(
                 init_image_latents, start_timestep, init_noise
             )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+            latents = latents.to(device=pipe.execution_device, dtype=resolved_sample_dtype)
     else:
         sigmas = build_sampling_sigmas(
             pipe.scheduler,
@@ -394,7 +454,7 @@ def _generate_image(
                 dtype=noise_dtype,
                 generator=init_generator,
             )
-            latents = latents.to(device=pipe.execution_device, dtype=sample_dtype)
+            latents = latents.to(device=pipe.execution_device, dtype=resolved_sample_dtype)
         else:
             init_image_latents = align_tensor_batch_size(
                 init_image_latents,
@@ -410,7 +470,7 @@ def _generate_image(
                 device=noise_device,
                 dtype=noise_dtype,
                 generator=init_generator,
-            ).to(device=pipe.execution_device, dtype=sample_dtype)
+            ).to(device=pipe.execution_device, dtype=resolved_sample_dtype)
             sigma_start = sigmas[0].to(init_image_latents.dtype)
             latents = (
                 sigma_start * init_noise + (1.0 - sigma_start) * init_image_latents
@@ -427,9 +487,12 @@ def _generate_image(
             pos_cond = prompt_embeds.to(
                 device=pipe.execution_device, dtype=pipe.model_dtype
             )
-            neg_cond = negative_prompt_embeds.to(  # type: ignore[union-attr]
-                device=pipe.execution_device, dtype=pipe.model_dtype
-            )
+            if use_cfg:
+                neg_cond = negative_prompt_embeds.to(  # type: ignore[union-attr]
+                    device=pipe.execution_device, dtype=pipe.model_dtype
+                )
+            else:
+                neg_cond = None
         else:
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 pipe,
@@ -440,6 +503,15 @@ def _generate_image(
                 neg_t5_ids=neg_t5_ids,
                 neg_t5_weights=neg_t5_weights,
             )
+
+        pos_cond = pos_cond.to(device=pipe.execution_device, dtype=pipe.model_dtype)
+        if neg_cond is not None:
+            neg_cond = neg_cond.to(device=pipe.execution_device, dtype=pipe.model_dtype)
+            if effective_cfg_batch_mode == "concat":
+                # Precompute the static CFG conditioning batch once. The previous
+                # path rebuilt this concatenation at every denoising step.
+                pos_cond = torch.cat([pos_cond, neg_cond], dim=0)
+                neg_cond = None
 
         if sampler == "flowmatch_euler":
             if flowmatch_timesteps is None:
@@ -456,8 +528,9 @@ def _generate_image(
                 pos_cond=pos_cond,
                 neg_cond=neg_cond,
                 guidance_scale=guidance_scale,
-                cfg_batch_mode=cfg_batch_mode,
+                cfg_batch_mode=effective_cfg_batch_mode,
                 model_dtype=pipe.model_dtype,
+                check_finite=check_finite,
                 callback_on_step_end=callback_on_step_end,
                 callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
                 inpaint_mask=inpaint_mask,
@@ -481,8 +554,9 @@ def _generate_image(
                 eta=eta,
                 s_noise=s_noise,
                 generator=step_generator,
-                cfg_batch_mode=cfg_batch_mode,
+                cfg_batch_mode=effective_cfg_batch_mode,
                 model_dtype=pipe.model_dtype,
+                check_finite=check_finite,
                 callback_on_step_end=callback_on_step_end,
                 callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
                 input_is_noisy_latents=input_is_noisy_latents,
@@ -678,7 +752,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             allowed_inputs=self._callback_tensor_inputs,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_prompt(
         self,
         prompt: PromptInput,
@@ -738,7 +812,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             )
         return pos_cond, neg_cond
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         prompt: PromptInput,
@@ -754,7 +828,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         num_images_per_prompt: int = 1,
         guidance_scale: float = 4.0,
         generator: GeneratorInput | None = None,
-        cfg_batch_mode: str = "split",
+        cfg_batch_mode: str = "auto",
+        sample_dtype: str | torch.dtype = "auto",
+        check_finite: bool = False,
         output_type: str = "pil",
         return_dict: bool = True,
         callback_on_step_end: Callable[..., dict[str, Any] | None] | None = None,
@@ -780,11 +856,15 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             num_images_per_prompt: Number of images to generate per prompt.
             guidance_scale: Classifier-free guidance scale.
             generator: Optional RNG seed(s).
-            cfg_batch_mode: How to run classifier-free guidance. ``split`` runs
-                positive and negative conditioning as two sequential forward passes
-                (more numerically stable, lower peak VRAM per pass). ``concat``
-                batches them into a single forward (higher throughput on large GPUs,
-                but roughly doubles the batch size and may require more peak VRAM).
+            cfg_batch_mode: How to run classifier-free guidance. ``auto`` uses
+                Diffusers-style batched CFG on CUDA and ``split`` elsewhere.
+                ``split`` runs positive and negative conditioning as two sequential
+                forward passes. ``concat`` batches them into a single forward.
+            sample_dtype: Latent/sampling dtype. ``auto`` uses the model dtype on
+                CUDA/MPS when possible and float32 on CPU. Use ``float32`` to keep
+                the older more conservative path.
+            check_finite: Run per-step NaN/Inf checks for fp16 debugging. Disabled
+                by default because it forces GPU synchronisation every step.
             output_type: ``pil``, ``np``, or ``latent``.
             return_dict: Return ``AnimaPipelineOutput`` when ``True``.
             callback_on_step_end: Optional callable invoked at each step end.
@@ -861,6 +941,8 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 eta=eta,
                 s_noise=s_noise,
                 cfg_batch_mode=cfg_batch_mode,
+                sample_dtype=sample_dtype,
+                check_finite=check_finite,
                 output_type=output_type,
                 callback_on_step_end=callback_on_step_end,
                 callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
@@ -880,6 +962,47 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         if not return_dict:
             return (output_images,)
         return AnimaPipelineOutput(images=output_images)
+
+    def compile_components(
+        self,
+        *,
+        transformer: bool = True,
+        vae: bool = False,
+        mode: str | None = "reduce-overhead",
+        fullgraph: bool = False,
+        dynamic: bool | None = None,
+        backend: str | None = None,
+    ) -> "AnimaPipeline":
+        """Compile hot inference modules with ``torch.compile`` and return ``self``.
+
+        This mirrors the common Diffusers optimisation pattern where users compile
+        the denoiser/transformer after loading. Compilation has a first-call cost,
+        so it is intended for repeated generation with the same pipeline.
+        """
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            raise RuntimeError("torch.compile is not available in this PyTorch build.")
+
+        kwargs: dict[str, Any] = {"fullgraph": fullgraph}
+        if mode is not None:
+            kwargs["mode"] = mode
+        if dynamic is not None:
+            kwargs["dynamic"] = dynamic
+        if backend is not None:
+            kwargs["backend"] = backend
+
+        if transformer:
+            self.transformer = compile_fn(self.transformer, **kwargs)
+        if vae:
+            self.vae = compile_fn(self.vae, **kwargs)
+        return self
+
+    def enable_torch_compile(
+        self,
+        **kwargs: Any,
+    ) -> "AnimaPipeline":
+        """Backward-friendly alias for ``compile_components``."""
+        return self.compile_components(**kwargs)
 
     def enable_model_cpu_offload(
         self,
@@ -968,6 +1091,11 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         )
 
     @classmethod
+    def clear_component_cache(cls) -> None:
+        """Clear the raw-file loader cache used by from_single_file/from_multiple_files."""
+        clear_anima_component_cache()
+
+    @classmethod
     def _from_pretrained_local_directory(
         cls,
         pretrained_model_name_or_path: str,
@@ -997,6 +1125,8 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                     token=load_options.token,
                     revision=load_options.revision,
                     proxies=load_options.proxies,
+                    cache_components=load_options.cache_components,
+                    cache_transformer=False,
                 )
             loaded.prompt_tokenizer = load_prompt_tokenizer(
                 qwen_tokenizer_source=qwen_source,
@@ -1183,6 +1313,13 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         ``vae_path`` points to the Anima VAE checkpoint. Each path accepts the
         same source forms as ``from_single_file``: a local file,
         ``repo_id::filename``, or a Hugging Face file URL.
+
+        Reload speed options:
+        - ``cache_components=True`` keeps text encoder, VAE, and tokenizers in an
+          in-process cache.
+        - ``cache_transformer=True`` also caches the transformer when the exact
+          same model file is reloaded. This is fastest but keeps the model in
+          memory until ``AnimaPipeline.clear_component_cache()`` is called.
         """
         _raise_if_removed_from_pretrained_runtime_feature_kwargs(
             kwargs, api_name="from_multiple_files"
