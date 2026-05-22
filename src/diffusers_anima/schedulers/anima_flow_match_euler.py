@@ -11,12 +11,18 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers import SchedulerMixin as SchedulerMixin  # noqa: F401
 
 from ..pipelines.anima.constants import FORGE_BETA_ALPHA, FORGE_BETA_BETA
+from .anima_er_sde import (
+    DEFAULT_ER_SDE_MAX_STAGE,
+    ER_SDE_SAMPLER_NAME,
+    validate_er_sde_max_stage,
+)
 
 SUPPORTED_ANIMA_SAMPLERS = (
     "flowmatch_euler",
     "euler",
     "euler_a_rf",
     "euler_ancestral_rf",
+    ER_SDE_SAMPLER_NAME,
 )
 SUPPORTED_ANIMA_SIGMA_SCHEDULES = ("beta", "uniform", "simple", "normal")
 
@@ -25,7 +31,8 @@ def _validate_anima_sampler_config(*, sampler: str, sigma_schedule: str) -> None
     """Validate Anima sampler/sigma schedule combinations."""
     if sampler not in SUPPORTED_ANIMA_SAMPLERS:
         raise ValueError(
-            "`sampler` must be one of: flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf."
+            "`sampler` must be one of: flowmatch_euler, euler, "
+            "euler_a_rf, euler_ancestral_rf, er_sde."
         )
     if sigma_schedule not in SUPPORTED_ANIMA_SIGMA_SCHEDULES:
         raise ValueError(
@@ -33,6 +40,7 @@ def _validate_anima_sampler_config(*, sampler: str, sigma_schedule: str) -> None
         )
     if sampler == "flowmatch_euler" and sigma_schedule != "uniform":
         raise ValueError("`flowmatch_euler` requires `sigma_schedule='uniform'`.")
+
 
 
 def _scheduler_config_get(config: Any, *, key: str, default: Any) -> Any:
@@ -54,6 +62,7 @@ class AnimaSamplingConfig:
     beta_beta: float
     eta: float
     s_noise: float
+    er_sde_max_stage: int
 
 
 class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
@@ -88,6 +97,7 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         beta_beta: float = FORGE_BETA_BETA,
         eta: float = 1.0,
         s_noise: float = 1.0,
+        er_sde_max_stage: int = DEFAULT_ER_SDE_MAX_STAGE,
     ):
         super().__init__(
             num_train_timesteps=num_train_timesteps,
@@ -112,6 +122,7 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             beta_beta=beta_beta,
             eta=eta,
             s_noise=s_noise,
+            er_sde_max_stage=er_sde_max_stage,
         )
 
     def set_sampling_config(
@@ -123,9 +134,11 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         beta_beta: float = FORGE_BETA_BETA,
         eta: float = 1.0,
         s_noise: float = 1.0,
+        er_sde_max_stage: int = DEFAULT_ER_SDE_MAX_STAGE,
     ) -> None:
         """Persist Anima sampling knobs into scheduler config."""
         _validate_anima_sampler_config(sampler=sampler, sigma_schedule=sigma_schedule)
+        validate_er_sde_max_stage(int(er_sde_max_stage))
         self.register_to_config(
             sampler=sampler,
             sigma_schedule=sigma_schedule,
@@ -133,6 +146,7 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             beta_beta=float(beta_beta),
             eta=float(eta),
             s_noise=float(s_noise),
+            er_sde_max_stage=int(er_sde_max_stage),
         )
 
     def get_sampling_config(self) -> AnimaSamplingConfig:
@@ -152,7 +166,11 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         )
         eta = float(_scheduler_config_get(config, key="eta", default=1.0))
         s_noise = float(_scheduler_config_get(config, key="s_noise", default=1.0))
+        er_sde_max_stage = int(
+            _scheduler_config_get(config, key="er_sde_max_stage", default=DEFAULT_ER_SDE_MAX_STAGE)
+        )
         _validate_anima_sampler_config(sampler=sampler, sigma_schedule=sigma_schedule)
+        validate_er_sde_max_stage(er_sde_max_stage)
         return AnimaSamplingConfig(
             sampler=sampler,
             sigma_schedule=sigma_schedule,
@@ -160,4 +178,5 @@ class AnimaFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             beta_beta=beta_beta,
             eta=eta,
             s_noise=s_noise,
+            er_sde_max_stage=er_sde_max_stage,
         )

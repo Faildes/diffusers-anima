@@ -120,7 +120,7 @@ def _validate_image_like_input(
 def _validate_sampler_schedule(*, sampler: str, sigma_schedule: str) -> None:
     if sampler not in _SUPPORTED_SAMPLERS:
         raise ValueError(
-            "`sampler` must be one of: flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf."
+            "`sampler` must be one of: flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf, er_sde."
         )
     if sigma_schedule not in _SUPPORTED_SIGMA_SCHEDULES:
         raise ValueError(
@@ -186,6 +186,9 @@ def _warn_ignored_sampling_arguments(
             ignored.append("eta")
         if not math.isclose(s_noise, 1.0):
             ignored.append("s_noise")
+    elif sampler == "er_sde":
+        if not math.isclose(eta, 1.0):
+            ignored.append("eta")
 
     if ignored:
         warnings.warn(

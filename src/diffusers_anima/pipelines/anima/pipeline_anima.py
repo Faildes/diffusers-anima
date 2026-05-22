@@ -327,6 +327,7 @@ def _generate_image(
     beta_beta: float = FORGE_BETA_BETA,
     eta: float = 1.0,
     s_noise: float = 1.0,
+    er_sde_max_stage: int = 3,
     cfg_batch_mode: str = "auto",
     sample_dtype: str | torch.dtype = "auto",
     check_finite: bool = False,
@@ -557,6 +558,7 @@ def _generate_image(
                 cfg_batch_mode=effective_cfg_batch_mode,
                 model_dtype=pipe.model_dtype,
                 check_finite=check_finite,
+                er_sde_max_stage=er_sde_max_stage,
                 callback_on_step_end=callback_on_step_end,
                 callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
                 input_is_noisy_latents=input_is_noisy_latents,
@@ -872,11 +874,13 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
 
         Notes:
             Sampling parameters (sampler, sigma_schedule, eta, s_noise, beta_alpha,
-            beta_beta) are first-class scheduler config options. Set them with
+            beta_beta, er_sde_max_stage) are first-class scheduler config options. Set them with
             ``pipe.scheduler.set_sampling_config(...)`` before calling.
 
             - ``flowmatch_euler`` requires ``sigma_schedule='uniform'``.
             - ``eta`` and ``s_noise`` are ignored for ``flowmatch_euler`` and ``euler``.
+            - ``eta`` is ignored for ``er_sde``; ``s_noise`` controls ER-SDE stochasticity.
+            - ``er_sde_max_stage`` is used only for ``er_sde`` and must be 1, 2, or 3.
             - ``beta_alpha`` and ``beta_beta`` are used only for ``sigma_schedule='beta'``.
         """
         sampling_config: AnimaSamplingConfig = self.scheduler.get_sampling_config()
@@ -886,6 +890,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         beta_beta = sampling_config.beta_beta
         eta = sampling_config.eta
         s_noise = sampling_config.s_noise
+        er_sde_max_stage = sampling_config.er_sde_max_stage
         resolved_callback_tensor_inputs = callback_on_step_end_tensor_inputs
         if resolved_callback_tensor_inputs is None:
             resolved_callback_tensor_inputs = ["latents"]
@@ -940,6 +945,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 beta_beta=beta_beta,
                 eta=eta,
                 s_noise=s_noise,
+                er_sde_max_stage=er_sde_max_stage,
                 cfg_batch_mode=cfg_batch_mode,
                 sample_dtype=sample_dtype,
                 check_finite=check_finite,

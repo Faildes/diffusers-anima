@@ -11,6 +11,7 @@ import torch
 
 from .constants import ANIMA_SAMPLING_MULTIPLIER
 from .image_processing import _ensure_finite
+from .sampler_er_sde import sample_er_sde
 
 
 GeneratorInput = torch.Generator | list[torch.Generator] | tuple[torch.Generator, ...]
@@ -397,6 +398,7 @@ def sample_euler_ancestral_rf(
     return latents
 
 
+
 def sample_flowmatch_euler(
     transformer: "ModelMixin",
     scheduler: "SchedulerMixin",
@@ -493,6 +495,7 @@ def run_const_sigma_samplers(
     cfg_batch_mode: str,
     model_dtype: torch.dtype,
     check_finite: bool = False,
+    er_sde_max_stage: int = 3,
     callback_on_step_end: Callable[..., dict[str, Any] | None] | None,
     callback_on_step_end_tensor_inputs: list[str],
     input_is_noisy_latents: bool = False,
@@ -525,6 +528,31 @@ def run_const_sigma_samplers(
             init_noise=init_noise,
         )
 
+    if sampler == "er_sde":
+        return sample_er_sde(
+            transformer,
+            pipeline,
+            latents,
+            sigmas=sigmas,
+            pos_cond=pos_cond,
+            neg_cond=neg_cond,
+            guidance_scale=guidance_scale,
+            s_noise=s_noise,
+            generator=generator,
+            cfg_batch_mode=cfg_batch_mode,
+            model_dtype=model_dtype,
+            check_finite=check_finite,
+            er_sde_max_stage=er_sde_max_stage,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            inpaint_mask=inpaint_mask,
+            init_image_latents=init_image_latents,
+            init_noise=init_noise,
+            predict_denoised=_predict_denoised_const,
+            run_step_callback=_run_step_callback,
+            randn_like_fn=randn_like,
+        )
+
     if sampler in {"euler_a_rf", "euler_ancestral_rf"}:
         return sample_euler_ancestral_rf(
             transformer,
@@ -549,5 +577,5 @@ def run_const_sigma_samplers(
 
     raise ValueError(
         f"Unsupported sampler '{sampler}'. Choose one of: "
-        "flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf."
+        "flowmatch_euler, euler, euler_a_rf, euler_ancestral_rf, er_sde."
     )
