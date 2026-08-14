@@ -491,8 +491,21 @@ def _convert_anima_state_dict_to_diffusers(
         "mlp.layer2.weight": "ff.net.2.weight",
     }
 
+    # Cosmos/Anima checkpoints persist positional-index helper buffers which
+    # Diffusers reconstructs from the transformer config at runtime. They are
+    # not trainable model weights and have no destination in
+    # CosmosTransformer3DModel.state_dict(). Keep this list explicit so an
+    # actually unknown checkpoint key still fails loudly below.
+    ignored_checkpoint_keys = {
+        "pos_embedder.dim_spatial_range",
+        "pos_embedder.dim_temporal_range",
+        "pos_embedder.seq",
+    }
+
     block_re = re.compile(r"^blocks\.(\d+)\.(.+)$")
     for key, value in state_dict.items():
+        if key in ignored_checkpoint_keys:
+            continue
         if key.startswith("llm_adapter."):
             adapter[".".join(["llm_adapter", key.removeprefix("llm_adapter.")])] = value
             continue

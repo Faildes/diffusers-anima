@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from diffusers_anima.pipelines.anima.loading import _strip_wrapping_prefixes
+from diffusers_anima.pipelines.anima.loading import (
+    _strip_wrapping_prefixes,
+    infer_anima_num_layers,
+)
 
 
 def _sample_anima_like_state_dict() -> dict[str, torch.Tensor]:
@@ -91,3 +94,34 @@ def test_strip_wrapping_prefixes_does_not_strip_when_prefix_is_not_shared() -> N
 
 def test_strip_wrapping_prefixes_on_empty_state_dict() -> None:
     assert _strip_wrapping_prefixes({}) == {}
+
+
+def _synthetic_block_state_dict(num_layers: int, prefix: str = "") -> dict[str, torch.Tensor]:
+    return {
+        f"{prefix}blocks.{index}.self_attn.q_proj.weight": torch.zeros(1)
+        for index in range(num_layers)
+    }
+
+
+def test_infer_anima_num_layers_original_28() -> None:
+    assert infer_anima_num_layers(_synthetic_block_state_dict(28)) == 28
+
+
+def test_infer_anima_num_layers_expanded_40_net_prefix() -> None:
+    wrapped = _synthetic_block_state_dict(40, prefix="net.")
+    canonical = _strip_wrapping_prefixes(wrapped)
+    assert infer_anima_num_layers(canonical) == 40
+
+
+def test_infer_anima_num_layers_expanded_40_comfyui_prefix() -> None:
+    wrapped = _synthetic_block_state_dict(40, prefix="model.diffusion_model.")
+    canonical = _strip_wrapping_prefixes(wrapped)
+    assert infer_anima_num_layers(canonical) == 40
+
+
+def test_infer_anima_num_layers_rejects_gapped_blocks() -> None:
+    state = _synthetic_block_state_dict(40)
+    state.pop("blocks.17.self_attn.q_proj.weight")
+    import pytest
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        infer_anima_num_layers(state)

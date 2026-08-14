@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections import OrderedDict
 from pathlib import Path
@@ -47,6 +48,37 @@ _TEXT_ENCODER_CONFIG_REPO = "Qwen/Qwen3-0.6B-Base"
 _QWEN_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_qwen"
 _T5_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_t5"
 _VAE_SOURCE = f"{_ANIMA_REPO}::vae/diffusion_pytorch_model.safetensors"
+
+
+_ANIMA_MAIN_BLOCK_RE = re.compile(r"^blocks\.(\d+)\.")
+
+
+def infer_anima_num_layers(state_dict: dict[str, torch.Tensor]) -> int:
+    """Infer the Anima main-transformer depth from canonical checkpoint keys.
+
+    The input must already have outer wrappers removed (``net.``, ``model.``,
+    ``diffusion_model.``). Both the original 28-block Anima architecture and
+    expanded variants such as Anima 2.9B (40 blocks) are therefore handled by
+    the same loader without a model-name switch.
+    """
+    block_indices = {
+        int(match.group(1))
+        for key in state_dict
+        if (match := _ANIMA_MAIN_BLOCK_RE.match(key)) is not None
+    }
+    if not block_indices:
+        raise RuntimeError("Could not infer Anima transformer depth: no 'blocks.<index>.' keys found.")
+
+    num_layers = max(block_indices) + 1
+    expected = set(range(num_layers))
+    if block_indices != expected:
+        missing = sorted(expected - block_indices)
+        raise RuntimeError(
+            "Anima transformer block indices are not contiguous from 0. "
+            f"Detected {num_layers} layers by max index but missing: {missing[:16]}"
+            + (" ..." if len(missing) > 16 else "")
+        )
+    return num_layers
 
 
 # ---------------------------------------------------------------------------
@@ -629,12 +661,13 @@ def load_transformer_native(
 
     state_dict = load_file(model_path, device="cpu")
     state_dict = _strip_wrapping_prefixes(state_dict)
+    num_layers = infer_anima_num_layers(state_dict)
     core_state_dict, llm_adapter_state_dict = _convert_anima_state_dict_to_diffusers(
         state_dict
     )
     del state_dict
 
-    transformer = AnimaTransformerModel()
+    transformer = AnimaTransformerModel(num_layers=num_layers)
     merged_state = {**core_state_dict, **llm_adapter_state_dict}
 
     missing, unexpected = transformer.load_state_dict(merged_state, strict=False)

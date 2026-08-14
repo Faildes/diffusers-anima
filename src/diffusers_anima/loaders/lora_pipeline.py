@@ -204,17 +204,29 @@ def _split_lora_key_suffix(key: str) -> tuple[str, str]:
     raise ValueError(f"Unsupported LoRA key: {key}")
 
 
+def _strip_anima_module_wrappers(path: str) -> str:
+    """Strip checkpoint/LoRA wrapper namespaces without assuming one exporter.
+
+    Common Anima files use ``net.*`` while ComfyUI-style exports often use
+    ``model.diffusion_model.*``. Some tools stack those wrappers, so normalize
+    them iteratively before mapping the underlying module path.
+    """
+    normalized = path
+    prefixes = ("transformer.", "net.", "model.", "diffusion_model.")
+    while True:
+        for prefix in prefixes:
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                break
+        else:
+            return normalized
+
+
 def _map_anima_module_path(raw_path: str) -> str:
     path = raw_path
-    if path.startswith("transformer."):
-        path = path.removeprefix("transformer.")
-
-    if path.startswith("diffusion_model."):
-        path = path.removeprefix("diffusion_model.")
-    elif path.startswith("model."):
-        path = path.removeprefix("model.")
-    elif path.startswith("lora_unet_"):
+    if path.startswith("lora_unet_"):
         path = _normalize_lora_unet_path(path.removeprefix("lora_unet_"))
+    path = _strip_anima_module_wrappers(path)
 
     if path.startswith("transformer_blocks."):
         return f"core.{path}"
