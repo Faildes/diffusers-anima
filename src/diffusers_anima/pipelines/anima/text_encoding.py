@@ -15,8 +15,9 @@ if TYPE_CHECKING:
 
 import torch
 
-# Qwen3 vocabulary: token ID used as pad when the tokenizer has no pad_token_id set.
-# Corresponds to the <|endoftext|> / eos token in Qwen3-0.6B (vocab size 151936).
+# Legacy fallback used only when a tokenizer does not expose pad/eos ids.
+# Qwen3.5 tokenizers normally provide their own values, so model-specific IDs are
+# never forced when they are available.
 _QWEN3_DEFAULT_PAD_TOKEN_ID: int = 151643
 
 # Maximum sequence length the LLM adapter conditioning tensor is padded / truncated to.
@@ -65,6 +66,8 @@ class AnimaPromptTokenizer:
 
         qwen_pad = self.qwen_tokenizer.pad_token_id
         if qwen_pad is None:
+            qwen_pad = self.qwen_tokenizer.eos_token_id
+        if qwen_pad is None:
             qwen_pad = _QWEN3_DEFAULT_PAD_TOKEN_ID
         if len(qwen_ids) == 0:
             qwen_ids = [int(qwen_pad)]
@@ -78,6 +81,8 @@ class AnimaPromptTokenizer:
             t5_ids = [*t5_ids, int(t5_eos)]
 
         return {
+            "qwen": [[(int(token_id), 1.0) for token_id in qwen_ids]],
+            # Backward-compatible alias for callers that still inspect this key.
             "qwen3_06b": [[(int(token_id), 1.0) for token_id in qwen_ids]],
             "t5xxl": [[(int(token_id), 1.0) for token_id in t5_ids]],
         }
@@ -99,6 +104,27 @@ def _extract_ids_and_weights(
     return token_ids, token_weights
 
 
+def resolve_text_encoder_backbone(text_encoder: "PreTrainedModel") -> "PreTrainedModel":
+    """Return the text backbone that yields token hidden states.
+
+    Qwen3 is already a text-only model. Qwen3.5 may be represented either by a
+    full multimodal wrapper (``model.language_model``) or, preferably, by the
+    text-only causal-LM wrapper (``model``). Both expose the same language
+    backbone to Anima without requiring a second text model.
+    """
+    direct = getattr(text_encoder, "language_model", None)
+    if direct is not None:
+        return direct
+    model = getattr(text_encoder, "model", None)
+    nested = getattr(model, "language_model", None) if model is not None else None
+    if nested is not None:
+        return nested
+    # Qwen3.5 text-only causal LM: ``text_encoder.model`` is the text backbone.
+    if model is not None and hasattr(model, "layers") and hasattr(model, "embed_tokens"):
+        return model
+    return text_encoder
+
+
 def prepare_condition_inputs(
     prompt_tokenizer: AnimaPromptTokenizer,
     text_encoder: "PreTrainedModel",
@@ -106,12 +132,13 @@ def prepare_condition_inputs(
     *,
     execution_device: str,
     model_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tokenize and encode a batch of prompts into conditioning tensors.
 
     Returns:
-        qwen_hidden: Qwen3 hidden states, shape ``(B, T_q, D)``.
-        t5_ids: T5-XXL token IDs, shape ``(B, T_t5)``.
+        qwen_hidden: Qwen hidden states, shape ``(B, T_q, D)``.
+        qwen_mask: Source-token attention mask, shape ``(B, T_q)``.
+        t5_ids: T5 token IDs, shape ``(B, T_t5)``.
         t5_weights: Per-token T5 weights, shape ``(B, T_t5, 1)``.
     """
     if len(prompt) == 0:
@@ -119,7 +146,9 @@ def prepare_condition_inputs(
 
     qwen_pad = prompt_tokenizer.qwen_tokenizer.pad_token_id
     if qwen_pad is None:
-        qwen_pad = 151643
+        qwen_pad = prompt_tokenizer.qwen_tokenizer.eos_token_id
+    if qwen_pad is None:
+        qwen_pad = _QWEN3_DEFAULT_PAD_TOKEN_ID
     t5_pad = prompt_tokenizer.t5_tokenizer.pad_token_id
     if t5_pad is None:
         t5_pad = 0
@@ -132,11 +161,12 @@ def prepare_condition_inputs(
 
     for text in prompt:
         tokenized = prompt_tokenizer.tokenize_with_weights(text)
-        qwen_token_ids, _ = _extract_ids_and_weights(tokenized["qwen3_06b"][0])
+        qwen_pairs = tokenized.get("qwen", tokenized["qwen3_06b"])[0]
+        qwen_token_ids, _ = _extract_ids_and_weights(qwen_pairs)
         t5_token_ids, t5_token_weights = _extract_ids_and_weights(tokenized["t5xxl"][0])
 
         if len(qwen_token_ids) == 0:
-            qwen_token_ids = [_QWEN3_DEFAULT_PAD_TOKEN_ID]
+            qwen_token_ids = [int(qwen_pad)]
         if len(t5_token_ids) == 0:
             t5_token_ids = [1]
             t5_token_weights = [1.0]
@@ -186,27 +216,35 @@ def prepare_condition_inputs(
         )
 
     with torch.inference_mode():
-        text_encoder_out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
+        text_backbone = resolve_text_encoder_backbone(text_encoder)
+        text_encoder_out = text_backbone(input_ids=qwen_ids, attention_mask=qwen_mask)
         if isinstance(text_encoder_out, tuple):
             qwen_hidden = text_encoder_out[0]
         else:
             qwen_hidden = text_encoder_out.last_hidden_state
         qwen_hidden = qwen_hidden.to(model_dtype)
-    return qwen_hidden, t5_ids, t5_weights
+    return qwen_hidden, qwen_mask, t5_ids, t5_weights
 
 
 def build_condition(
     transformer: "ModelMixin",
     *,
     qwen_hidden: torch.Tensor,
+    qwen_mask: torch.Tensor | None,
     t5_ids: torch.Tensor,
     t5_weights: torch.Tensor,
 ) -> torch.Tensor:
     """Run the LLM adapter and pad the conditioning sequence to 512 tokens."""
     with torch.inference_mode():
         cond = transformer.preprocess_text_embeds(
-            qwen_hidden, t5_ids, t5xxl_weights=t5_weights
+            qwen_hidden,
+            t5_ids,
+            t5xxl_weights=t5_weights,
+            source_attention_mask=qwen_mask,
         )
+    # The semantic frontend is expected to fit prompts before this point; this
+    # slice is a final contract guard so the DiT never receives >512 positions.
+    cond = cond[:, :_CONDITIONING_MAX_LENGTH]
     pad_len = max(0, _CONDITIONING_MAX_LENGTH - cond.shape[1])
     if pad_len > 0:
         cond = torch.nn.functional.pad(cond, (0, 0, 0, pad_len))

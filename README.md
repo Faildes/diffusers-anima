@@ -115,3 +115,31 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/api.md`](docs/api.md) | Full API reference (loading, generation, sampling config) |
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
+
+## Anima 2.9B + Qwen3.5 semantic frontend
+
+Raw three-file loading can use the original Qwen3-0.6B encoder or an official
+Qwen3.5-0.8B checkpoint. The loader detects Qwen3.5 from its hybrid
+`linear_attn` / `model.language_model` keys and automatically selects the
+Qwen3.5 tokenizer. For an official full Qwen3.5 checkpoint, the loader extracts
+only `model.language_model.*` into the official text-only causal-LM wrapper.
+This keeps `generate()` available for the optional prompt compiler without
+allocating Qwen3.5's unused vision tower or MTP modules, so one Qwen checkpoint
+still serves both compilation and Anima text encoding.
+
+```python
+from diffusers_anima import AnimaPipeline
+
+pipe = AnimaPipeline.from_multiple_files(
+    "Anima-2.9B.safetensors",
+    "Qwen3.5-0.8B.safetensors",
+    "vae.safetensors",
+    dtype="bfloat16",
+)
+```
+
+`AnimaPipeline.set_prompt_processor(processor)` installs an inference-only
+frontend. A processor may implement `process_batch(prompts, negative=False)` or
+be a callable. The image model still receives exactly 512 conditioning
+positions; long-prompt understanding/compression happens before tokenisation for
+the Anima LLM adapter.

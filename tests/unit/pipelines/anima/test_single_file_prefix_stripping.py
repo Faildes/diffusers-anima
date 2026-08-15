@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from diffusers_anima.pipelines.anima.loading import (
+    _extract_qwen35_causal_state_dict,
     _strip_wrapping_prefixes,
     infer_anima_num_layers,
 )
@@ -125,3 +126,35 @@ def test_infer_anima_num_layers_rejects_gapped_blocks() -> None:
     import pytest
     with pytest.raises(RuntimeError, match="not contiguous"):
         infer_anima_num_layers(state)
+
+
+def test_infer_text_encoder_family_qwen3() -> None:
+    from diffusers_anima.pipelines.anima.loading import infer_anima_text_encoder_family
+
+    state = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(1)}
+    assert infer_anima_text_encoder_family(state) == "qwen3"
+
+
+def test_infer_text_encoder_family_qwen35_full() -> None:
+    from diffusers_anima.pipelines.anima.loading import infer_anima_text_encoder_family
+
+    state = {"model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.zeros(1)}
+    assert infer_anima_text_encoder_family(state) == "qwen3.5"
+
+
+def test_extract_qwen35_causal_state_dict_drops_non_text_modules() -> None:
+    embed = torch.zeros(2, 2)
+    raw = {
+        "model.language_model.embed_tokens.weight": embed,
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.zeros(1),
+        "model.visual.blocks.0.attn.qkv.weight": torch.ones(1),
+        "mtp.layers.0.self_attn.q_proj.weight": torch.ones(1),
+    }
+
+    result = _extract_qwen35_causal_state_dict(raw)
+
+    assert "model.embed_tokens.weight" in result
+    assert "model.layers.0.linear_attn.in_proj_qkv.weight" in result
+    assert "lm_head.weight" in result
+    assert result["lm_head.weight"] is embed
+    assert not any("visual" in key or key.startswith("mtp.") for key in result)

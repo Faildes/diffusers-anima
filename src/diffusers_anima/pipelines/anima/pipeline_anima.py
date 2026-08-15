@@ -160,6 +160,8 @@ def _prepare_prompt_embedding_inputs(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -176,28 +178,32 @@ def _prepare_prompt_embedding_inputs(
                 "Load the pipeline via from_pretrained, from_single_file, or "
                 "from_multiple_files to ensure the tokenizer is initialised automatically."
             )
-        pos_hidden, pos_t5_ids, pos_t5_weights = prepare_condition_inputs(
+        processed_prompt = pipe._process_prompt_batch(prompt, negative=False)
+        pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
             pipe.text_encoder,
-            prompt,
+            processed_prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
         )
         if negative_prompt is None:
-            return pos_hidden, pos_t5_ids, pos_t5_weights, None, None, None
-        neg_hidden, neg_t5_ids, neg_t5_weights = prepare_condition_inputs(
+            return pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_weights, None, None, None, None
+        processed_negative_prompt = pipe._process_prompt_batch(negative_prompt, negative=True)
+        neg_hidden, neg_qwen_mask, neg_t5_ids, neg_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
             pipe.text_encoder,
-            negative_prompt,
+            processed_negative_prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
         )
 
     return (
         pos_hidden,
+        pos_qwen_mask,
         pos_t5_ids,
         pos_t5_weights,
         neg_hidden,
+        neg_qwen_mask,
         neg_t5_ids,
         neg_t5_weights,
     )
@@ -207,15 +213,18 @@ def _build_cfg_conditions_from_embeddings(
     pipe: "AnimaPipeline",
     *,
     pos_hidden: torch.Tensor,
+    pos_qwen_mask: torch.Tensor | None,
     pos_t5_ids: torch.Tensor,
     pos_t5_weights: torch.Tensor,
     neg_hidden: torch.Tensor | None,
+    neg_qwen_mask: torch.Tensor | None,
     neg_t5_ids: torch.Tensor | None,
     neg_t5_weights: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     pos_cond = build_condition(
         pipe.transformer,
         qwen_hidden=pos_hidden,
+        qwen_mask=pos_qwen_mask,
         t5_ids=pos_t5_ids,
         t5_weights=pos_t5_weights,
     )
@@ -224,6 +233,7 @@ def _build_cfg_conditions_from_embeddings(
     neg_cond = build_condition(
         pipe.transformer,
         qwen_hidden=neg_hidden,
+        qwen_mask=neg_qwen_mask,
         t5_ids=neg_t5_ids,
         t5_weights=neg_t5_weights,
     )
@@ -344,8 +354,8 @@ def _generate_image(
     )
     if prompt_embeds is not None:
         batch_size = prompt_embeds.shape[0]
-        pos_hidden = pos_t5_ids = pos_t5_weights = None
-        neg_hidden = neg_t5_ids = neg_t5_weights = None
+        pos_hidden = pos_qwen_mask = pos_t5_ids = pos_t5_weights = None
+        neg_hidden = neg_qwen_mask = neg_t5_ids = neg_t5_weights = None
     else:
         prompts, negative_prompts = _resolve_prompt_batches(
             prompt=prompt,
@@ -353,12 +363,19 @@ def _generate_image(
             num_images_per_prompt=num_images_per_prompt,
         )
         batch_size = len(prompts)
-        pos_hidden, pos_t5_ids, pos_t5_weights, neg_hidden, neg_t5_ids, neg_t5_weights = (
-            _prepare_prompt_embedding_inputs(
-                pipe,
-                prompt=prompts,
-                negative_prompt=negative_prompts if use_cfg else None,
-            )
+        (
+            pos_hidden,
+            pos_qwen_mask,
+            pos_t5_ids,
+            pos_t5_weights,
+            neg_hidden,
+            neg_qwen_mask,
+            neg_t5_ids,
+            neg_t5_weights,
+        ) = _prepare_prompt_embedding_inputs(
+            pipe,
+            prompt=prompts,
+            negative_prompt=negative_prompts if use_cfg else None,
         )
 
     height, width, latent_h, latent_w = latent_hw(
@@ -498,9 +515,11 @@ def _generate_image(
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 pipe,
                 pos_hidden=pos_hidden,
+                pos_qwen_mask=pos_qwen_mask,
                 pos_t5_ids=pos_t5_ids,
                 pos_t5_weights=pos_t5_weights,
                 neg_hidden=neg_hidden,
+                neg_qwen_mask=neg_qwen_mask,
                 neg_t5_ids=neg_t5_ids,
                 neg_t5_weights=neg_t5_weights,
             )
@@ -620,6 +639,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         model_dtype: torch.dtype = torch.float32,
         text_encoder_dtype: torch.dtype = torch.float32,
         use_module_cpu_offload: bool = False,
+        prompt_processor: Any | None = None,
     ):
         super().__init__()
         resolved_scheduler = coerce_anima_scheduler(scheduler)
@@ -639,8 +659,39 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.model_dtype = model_dtype
         self.text_encoder_dtype = text_encoder_dtype
         self.use_module_cpu_offload = use_module_cpu_offload
+        # Inference-only frontend (e.g. sd_embed.AnimaSemanticPromptFrontend).
+        # It is intentionally not register_modules()-managed and is not persisted.
+        self.prompt_processor = prompt_processor
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
+
+    def set_prompt_processor(self, processor: Any | None) -> "AnimaPipeline":
+        """Install an inference-time prompt frontend without changing model weights."""
+        self.prompt_processor = processor
+        return self
+
+    def clear_prompt_processor(self) -> "AnimaPipeline":
+        self.prompt_processor = None
+        return self
+
+    def _process_prompt_batch(self, prompts: list[str], *, negative: bool) -> list[str]:
+        processor = getattr(self, "prompt_processor", None)
+        if processor is None:
+            return list(prompts)
+        process_batch = getattr(processor, "process_batch", None)
+        if callable(process_batch):
+            processed = process_batch(list(prompts), negative=negative)
+            if len(processed) != len(prompts):
+                raise RuntimeError("prompt_processor.process_batch changed the prompt batch size.")
+            return [str(item) for item in processed]
+        output: list[str] = []
+        for text in prompts:
+            try:
+                value = processor(text, negative=negative)
+            except TypeError:
+                value = processor(text)
+            output.append(str(value))
+        return output
 
     @property
     def execution_device(self) -> str:
@@ -790,12 +841,19 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             negative_prompt=negative_prompt,
             num_images_per_prompt=num_images_per_prompt,
         )
-        pos_hidden, pos_t5_ids, pos_t5_weights, neg_hidden, neg_t5_ids, neg_t5_weights = (
-            _prepare_prompt_embedding_inputs(
-                self,
-                prompt=prompts,
-                negative_prompt=negative_prompts,
-            )
+        (
+            pos_hidden,
+            pos_qwen_mask,
+            pos_t5_ids,
+            pos_t5_weights,
+            neg_hidden,
+            neg_qwen_mask,
+            neg_t5_ids,
+            neg_t5_weights,
+        ) = _prepare_prompt_embedding_inputs(
+            self,
+            prompt=prompts,
+            negative_prompt=negative_prompts,
         )
         with _module_execution_context(
             self.transformer,
@@ -806,9 +864,11 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 self,
                 pos_hidden=pos_hidden,
+                pos_qwen_mask=pos_qwen_mask,
                 pos_t5_ids=pos_t5_ids,
                 pos_t5_weights=pos_t5_weights,
                 neg_hidden=neg_hidden,
+                neg_qwen_mask=neg_qwen_mask,
                 neg_t5_ids=neg_t5_ids,
                 neg_t5_weights=neg_t5_weights,
             )
@@ -1315,7 +1375,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """Load Anima from separate transformer, text encoder, and VAE files.
 
         ``model_path`` points to the Anima transformer checkpoint,
-        ``encoder_path`` points to the Qwen3-0.6B text encoder checkpoint, and
+        ``encoder_path`` points to a Qwen3-0.6B or Qwen3.5-0.8B checkpoint, and
         ``vae_path`` points to the Anima VAE checkpoint. Each path accepts the
         same source forms as ``from_single_file``: a local file,
         ``repo_id::filename``, or a Hugging Face file URL.

@@ -349,13 +349,26 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         text_embeds: torch.Tensor,
         text_ids: torch.Tensor | None,
         t5xxl_weights: torch.Tensor | None = None,
+        source_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_ids is None:
             return text_embeds
 
-        adapted = self.llm_adapter(text_embeds, text_ids)
+        target_attention_mask = None
+        if t5xxl_weights is not None:
+            target_attention_mask = (t5xxl_weights.squeeze(-1) != 0).to(dtype=torch.long)
+        adapted = self.llm_adapter(
+            text_embeds,
+            text_ids,
+            target_attention_mask=target_attention_mask,
+            source_attention_mask=source_attention_mask,
+        )
         if t5xxl_weights is not None:
             adapted = adapted * t5xxl_weights
+        # Preserve Anima's learned conditioning contract. Long user prompts should
+        # be semantically compiled before this point; truncation here is only a
+        # final safety guard for direct callers.
+        adapted = adapted[:, :512]
         return _pad_to_length(adapted, 512)
 
     def forward(
