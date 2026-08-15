@@ -1,5 +1,8 @@
 # diffusers-anima
 
+> **Anima 2.9B compatibility:** raw single-file loading infers the main transformer depth from checkpoint keys. Original 28-block Anima and expanded 40-block Anima 2.9B checkpoints are both supported, including `net.*` and `model.diffusion_model.*` wrapper prefixes.
+
+
 `diffusers-anima` provides an Anima pipeline implementation designed to align with [Diffusers](https://github.com/huggingface/diffusers) patterns.
 
 ## Install
