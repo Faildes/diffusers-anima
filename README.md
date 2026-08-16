@@ -143,3 +143,22 @@ frontend. A processor may implement `process_batch(prompts, negative=False)` or
 be a callable. The image model still receives exactly 512 conditioning
 positions; long-prompt understanding/compression happens before tokenisation for
 the Anima LLM adapter.
+
+
+### Independent Anima / Qwen Base pairing
+
+Raw component loading treats transformer depth and text-encoder family as orthogonal.
+Both `Qwen3-0.6B-Base` and `Qwen3.5-0.8B-Base` profiles can therefore be paired with
+either the original 28-block Anima transformer or a 40-block Anima 2.9B transformer.
+The text encoder is inferred from its parameter structure and the transformer depth is
+inferred independently from `blocks.<index>.*`. No SHA256 or filename allow-list is used.
+
+The default tokenizer/config sources are Base repositories:
+
+- `Qwen/Qwen3-0.6B-Base`
+- `Qwen/Qwen3.5-0.8B-Base`
+
+For raw Qwen3.5 single-file checkpoints, Base and post-trained checkpoints have the same
+model family/key topology. Without provenance metadata or a file hash, the loader cannot
+cryptographically distinguish them; it applies the Qwen3.5-0.8B-Base config/tokenizer
+profile to compatible Qwen3.5 weights.

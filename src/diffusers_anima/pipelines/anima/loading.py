@@ -56,7 +56,7 @@ _TEXT_ENCODER_WEIGHTS = f"{_ANIMA_REPO}::text_encoder/model.safetensors"
 _TEXT_ENCODER_CONFIG_REPO = QWEN3_06B_REPO
 _QWEN35_CONFIG_REPO = QWEN35_08B_REPO
 _QWEN35_TOKENIZER_SOURCE = QWEN35_08B_REPO
-_QWEN_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_qwen"
+_QWEN_TOKENIZER_SOURCE = QWEN3_06B_REPO
 _T5_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_t5"
 _VAE_SOURCE = f"{_ANIMA_REPO}::vae/diffusion_pytorch_model.safetensors"
 
@@ -597,7 +597,7 @@ def _extract_qwen35_causal_state_dict(
 ) -> dict[str, torch.Tensor]:
     """Extract Qwen3.5 text weights into ``Qwen3_5ForCausalLM`` key space.
 
-    Official Qwen3.5-0.8B checkpoints contain ``model.language_model.*`` plus
+    Official Qwen3.5-0.8B-Base checkpoints contain ``model.language_model.*`` plus
     vision and MTP weights. Anima only needs the language model, while the
     semantic prompt frontend also benefits from ``generate()``. Loading the
     text-only causal-LM wrapper gives us both capabilities without allocating
@@ -641,9 +641,9 @@ def load_text_encoder_single_file(
     options: AnimaLoaderOptions,
     cache: bool = False,
 ) -> PreTrainedModel:
-    """Load Qwen3-0.6B or Qwen3.5-0.8B from a raw safetensors file.
+    """Load Qwen3-0.6B-Base-profile or Qwen3.5-0.8B-Base-profile weights from a raw safetensors file.
 
-    For Qwen3.5, the official checkpoint is multimodal, but Anima does not need
+    For Qwen3.5-0.8B-Base, the official checkpoint is multimodal, but Anima does not need
     the visual tower. We extract ``model.language_model.*`` and instantiate the
     official text-only causal-LM wrapper. This preserves ``generate()`` for the
     inference-time prompt compiler while keeping runtime modules limited to the
@@ -675,12 +675,12 @@ def load_text_encoder_single_file(
             text_config = config
         text_encoder = AutoModelForCausalLM.from_config(text_config)
         state_dict = _extract_qwen35_causal_state_dict(raw_state_dict)
-        encoder_variant = "qwen3.5-causal"
+        encoder_variant = "qwen3.5-0.8b-base-causal"
     else:
         config = Qwen3Config(**QWEN3_06B_CONFIG)
         text_encoder = Qwen3Model(config)
         state_dict = _strip_model_prefix(raw_state_dict)
-        encoder_variant = "qwen3"
+        encoder_variant = "qwen3-0.6b-base-text"
 
     missing, unexpected = text_encoder.load_state_dict(state_dict, strict=False)
     # ``tie_weights`` is normally performed by from_pretrained; raw state-dict
@@ -698,6 +698,14 @@ def load_text_encoder_single_file(
 
     setattr(text_encoder, "_anima_text_encoder_family", family)
     setattr(text_encoder, "_anima_text_encoder_variant", encoder_variant)
+    setattr(
+        text_encoder,
+        "_anima_text_encoder_profile",
+        "qwen3.5-0.8b-base" if family == "qwen3.5" else "qwen3-0.6b-base",
+    )
+    # Text-encoder generation is intentionally independent of Anima transformer
+    # depth. Any supported encoder family can be paired with either 28-block
+    # Anima or 40-block Anima 2.9B because both expose 1024-d hidden states.
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)
     text_encoder.to(device=device, dtype=dtype)
@@ -730,7 +738,7 @@ def load_text_encoder(
 
 
 def resolve_qwen_tokenizer_source(text_encoder: PreTrainedModel) -> str:
-    """Select the tokenizer matching the loaded Qwen generation."""
+    """Select the Base-profile tokenizer matching the loaded Qwen family."""
     family = str(getattr(text_encoder, "_anima_text_encoder_family", "qwen3"))
     return _QWEN35_TOKENIZER_SOURCE if family == "qwen3.5" else _QWEN_TOKENIZER_SOURCE
 

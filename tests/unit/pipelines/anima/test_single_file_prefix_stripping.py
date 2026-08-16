@@ -158,3 +158,16 @@ def test_extract_qwen35_causal_state_dict_drops_non_text_modules() -> None:
     assert "lm_head.weight" in result
     assert result["lm_head.weight"] is embed
     assert not any("visual" in key or key.startswith("mtp.") for key in result)
+
+
+def test_anima_depth_and_text_encoder_family_are_independent() -> None:
+    from diffusers_anima.pipelines.anima.loading import infer_anima_text_encoder_family
+
+    qwen3_state = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(1)}
+    qwen35_state = {"model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.zeros(1)}
+
+    for depth in (28, 40):
+        transformer_state = _synthetic_block_state_dict(depth)
+        assert infer_anima_num_layers(transformer_state) == depth
+        assert infer_anima_text_encoder_family(qwen3_state) == "qwen3"
+        assert infer_anima_text_encoder_family(qwen35_state) == "qwen3.5"

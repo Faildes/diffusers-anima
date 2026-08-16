@@ -9,7 +9,7 @@ LOCAL_QWEN_TOKENIZER_DIR = "prompt_tokenizer_qwen"
 LOCAL_T5_TOKENIZER_DIR = "prompt_tokenizer_t5"
 
 QWEN3_06B_REPO = "Qwen/Qwen3-0.6B-Base"
-QWEN35_08B_REPO = "Qwen/Qwen3.5-0.8B"
+QWEN35_08B_REPO = "Qwen/Qwen3.5-0.8B-Base"
 
 
 ANIMA_VAE_CONFIG: dict[str, Any] = {
