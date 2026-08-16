@@ -675,6 +675,45 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.prompt_processor = None
         return self
 
+    def install_semantic_prompt_frontend(
+        self,
+        *,
+        mode: str = "auto",
+        target_t5_tokens: int = 192,
+        qwen_input_max_tokens: int = 8192,
+        compiler_max_new_tokens: int = 256,
+        system_prompt: str | None = None,
+        tag_resolver: Any | None = None,
+        process_negative_prompt: bool = False,
+        allow_generation: bool = True,
+        generation_kwargs: dict[str, Any] | None = None,
+        compression_retries: int = 1,
+    ) -> "AnimaPipeline":
+        """Install the inference-only semantic prompt frontend.
+
+        This uses the already-loaded Qwen text encoder to compress long user
+        prompts into a shorter prompt before native Anima encoding. The soft
+        budget defaults to 192 tokens because long prompts are often less
+        stable than short prompts even when they still fit within 512 tokens.
+        """
+        from .semantic_prompt import AnimaSemanticPromptFrontend, _DEFAULT_SYSTEM_PROMPT
+
+        frontend = AnimaSemanticPromptFrontend(
+            self,
+            mode=mode,
+            target_t5_tokens=target_t5_tokens,
+            qwen_input_max_tokens=qwen_input_max_tokens,
+            compiler_max_new_tokens=compiler_max_new_tokens,
+            system_prompt=system_prompt or _DEFAULT_SYSTEM_PROMPT,
+            tag_resolver=tag_resolver,
+            process_negative_prompt=process_negative_prompt,
+            allow_generation=allow_generation,
+            generation_kwargs=generation_kwargs,
+            compression_retries=compression_retries,
+        )
+        self.set_prompt_processor(frontend)
+        return self
+
     def set_text_encoder_conditioning_scale(self, scale: float) -> "AnimaPipeline":
         """Set the source-value gate applied before the Anima LLM adapter.
 

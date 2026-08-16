@@ -1,6 +1,17 @@
 """Anima support utilities for Diffusers."""
 
-from .pipelines.anima import AnimaPipeline, AnimaPipelineOutput
+from .pipelines.anima import (
+    AnimaPipeline,
+    AnimaPipelineOutput,
+    AnimaSemanticPromptFrontend,
+    PROMPT_MODE_AUTO,
+    PROMPT_MODE_COMPILE,
+    PROMPT_MODE_DIRECT,
+    PROMPT_MODE_HYBRID,
+    SemanticPromptResult,
+    TagLexiconResolver,
+    TagResolution,
+)
 from .schedulers import AnimaFlowMatchEulerDiscreteScheduler, AnimaSamplingConfig
 
 
@@ -34,4 +45,12 @@ __all__ = [
     "AnimaPipeline",
     "AnimaPipelineOutput",
     "AnimaSamplingConfig",
+    "AnimaSemanticPromptFrontend",
+    "SemanticPromptResult",
+    "TagLexiconResolver",
+    "TagResolution",
+    "PROMPT_MODE_AUTO",
+    "PROMPT_MODE_DIRECT",
+    "PROMPT_MODE_COMPILE",
+    "PROMPT_MODE_HYBRID",
 ]
