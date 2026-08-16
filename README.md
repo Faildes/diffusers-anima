@@ -115,25 +115,27 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/api.md`](docs/api.md) | Full API reference (loading, generation, sampling config) |
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
+| [`docs/text_encoder_profiles.md`](docs/text_encoder_profiles.md) | Qwen3.5/alternate encoder compatibility profile format |
 
-## Experimental alternate Qwen encoder bridge
+## Experimental aligned text-encoder profiles
 
-`from_multiple_files()` can load either the original Qwen3-0.6B text encoder or a
-Qwen3.5-0.8B text backbone.  Qwen3.5 uses its own tokenizer.  Because Anima's
-LLM adapter was trained on the Qwen3-0.6B hidden distribution, Qwen3.5 should be
-calibrated into that reference space before normal use.
+Anima's LLM adapter was trained against Qwen3-0.6B hidden states. Alternate
+encoders such as Qwen3.5-0.8B are shape-compatible at 1024 dimensions but are
+not representation-compatible by default. This repository therefore supports a
+self-describing `anima_text_encoder_profile_v2` artifact.
 
-Create a bridge once from a representative prompt corpus:
+The calibration corpus is optional on the command line; a deterministic 4096-line
+visual corpus is built in. You can also supply your own corpus with `--prompts`.
 
 ```bash
 python scripts/calibrate_text_encoder_bridge.py \
   --source-model /path/to/qwen3.5-0.8b-base.safetensors \
   --reference-model /path/to/qwen3-0.6b-base.safetensors \
-  --prompts /path/to/calibration_prompts.txt \
-  --output /path/to/qwen35_08b_to_qwen3_06b.safetensors
+  --output /path/to/qwen35_08b_to_qwen3_06b.profile.safetensors \
+  --dump-prompts /path/to/prompts_used.txt
 ```
 
-Then load it at runtime:
+The small profile is loaded next to an external encoder:
 
 ```python
 pipe = AnimaPipeline.from_multiple_files(
@@ -142,19 +144,39 @@ pipe = AnimaPipeline.from_multiple_files(
     vae_path=vae_path,
 )
 pipe.load_text_encoder_bridge(
-    "/path/to/qwen35_08b_to_qwen3_06b.safetensors",
-    center_strength=0.5,
-    variance_strength=0.0,
-)
-
-# No Anima-side cap on Qwen source memory. The Qwen model / hardware still set
-# practical context limits. T5 remains a 512-position query side and, by
-# default, samples query anchors across the full prompt when it is overlength.
-pipe.set_qwen_source_max_length(None)
-pipe.set_t5_query_strategy("uniform")
-pipe.set_adapter_source_position_mode("compress")
+    "/path/to/qwen35_08b_to_qwen3_06b.profile.safetensors"
+)  # uses held-out recommended strengths from the profile
 ```
 
-The bridge is an inference-time calibration transform (orthogonal Procrustes +
-centering, with optional per-dimension variance matching); it does not modify or
-train the Anima/Qwen weights.
+For a future single-file aligned encoder, create the same profile with source
+weights bundled into the `encoder.*` namespace:
+
+```bash
+python scripts/calibrate_text_encoder_bridge.py \
+  --source-model /path/to/qwen3.5-0.8b-base.safetensors \
+  --reference-model /path/to/qwen3-0.6b-base.safetensors \
+  --output /path/to/anima_qwen35_08b_aligned.safetensors \
+  --bundle-source-weights
+```
+
+That output can replace the ordinary encoder path directly:
+
+```python
+pipe = AnimaPipeline.from_multiple_files(
+    model_path=anima_path,
+    encoder_path="/path/to/anima_qwen35_08b_aligned.safetensors",
+    vae_path=vae_path,
+)
+# The embedded bridge is detected and attached automatically.
+```
+
+In both modes, Qwen source-memory length is separate from Anima's 512 target/query
+contract. `set_qwen_source_max_length(None)` keeps the source unrestricted by
+Anima, `set_t5_query_strategy("uniform")` spreads bounded T5 query anchors across
+the full prompt, and `set_adapter_source_position_mode("compress")` keeps long
+source KV while normalizing adapter RoPE positions into the learned range.
+
+The v2 profile stores architecture fingerprints, calibration-corpus hash,
+held-out validation metrics, recommended center/variance strengths, and optional
+future `bridge.input_projection` support for wider encoders. Calibration uses no
+gradients or optimizer.

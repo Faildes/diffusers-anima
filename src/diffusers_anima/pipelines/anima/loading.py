@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from collections import OrderedDict
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 
 from diffusers import AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler
 from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from safetensors.torch import load_file
 import torch
 from transformers import AutoTokenizer, Qwen3Config, Qwen3Model
@@ -36,6 +38,7 @@ from .constants import (
 )
 from .options import AnimaComponents, AnimaLoaderOptions, AnimaRuntimeOptions
 from .text_encoding import AnimaPromptTokenizer
+from .text_encoder_bridge import read_text_encoder_profile_metadata
 from .vae_conversion import convert_anima_vae_state_dict
 
 # ---------------------------------------------------------------------------
@@ -625,8 +628,41 @@ def load_text_encoder_single_file(
             cached.to(device=device, dtype=dtype)
             return cached
 
+    metadata: dict[str, str] = {}
+    try:
+        metadata = read_text_encoder_profile_metadata(file_path)
+    except Exception:
+        metadata = {}
+    profile_format = metadata.get("format") == "anima_text_encoder_profile_v2"
+
     state_dict = load_file(file_path, device="cpu")
-    family = _detect_text_encoder_family(state_dict)
+    if profile_format:
+        if metadata.get("contains_encoder_weights", "false").lower() != "true":
+            raise ValueError(
+                "This Anima text-encoder profile contains bridge calibration only and cannot be used "
+                "directly as encoder_path. Load the source encoder separately and call "
+                "pipe.load_text_encoder_bridge(profile_path), or create the profile with "
+                "--bundle-source-weights."
+            )
+        state_dict = {
+            key[len("encoder."):]: value
+            for key, value in state_dict.items()
+            if key.startswith("encoder.")
+        }
+        if not state_dict:
+            raise RuntimeError("Aligned encoder profile metadata says weights are bundled, but encoder.* tensors are missing.")
+        family = metadata.get("source_family", "qwen3.5")
+    else:
+        family = _detect_text_encoder_family(state_dict)
+
+    source_config_json = metadata.get("source_config_json") if profile_format else None
+    source_config: dict[str, Any] | None = None
+    if source_config_json:
+        try:
+            source_config = json.loads(source_config_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Aligned encoder profile contains invalid source_config_json metadata.") from exc
+
     if family == "qwen3.5":
         try:
             from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
@@ -635,13 +671,10 @@ def load_text_encoder_single_file(
                 "Qwen3.5 text-encoder loading requires a Transformers version "
                 "that provides Qwen3_5TextConfig/Qwen3_5TextModel. Upgrade transformers."
             ) from exc
-        text_state = _extract_qwen35_text_state_dict(state_dict)
+        text_state = dict(state_dict) if profile_format else _extract_qwen35_text_state_dict(state_dict)
         del state_dict
-        config = Qwen3_5TextConfig(**QWEN35_08B_TEXT_CONFIG)
+        config = Qwen3_5TextConfig(**(source_config or QWEN35_08B_TEXT_CONFIG))
         text_encoder = Qwen3_5TextModel(config)
-        # Some official/full Qwen3.5 checkpoints place auxiliary MTP tensors
-        # under the language-model namespace. They are not part of TextModel and
-        # must not turn an otherwise valid text backbone into a load failure.
         expected_keys = set(text_encoder.state_dict().keys())
         filtered_text_state = {
             key: value for key, value in text_state.items() if key in expected_keys
@@ -650,7 +683,7 @@ def load_text_encoder_single_file(
         missing, unexpected = text_encoder.load_state_dict(filtered_text_state, strict=False)
         if missing or unexpected:
             raise RuntimeError(
-                "Text encoder weights do not match expected Qwen3.5-0.8B text architecture. "
+                "Text encoder weights do not match expected Qwen3.5 text architecture. "
                 f"Missing: {len(missing)}, Unexpected: {len(unexpected)}; "
                 f"first missing={missing[:8]}, first unexpected={unexpected[:8]}"
             )
@@ -661,20 +694,29 @@ def load_text_encoder_single_file(
                 stacklevel=2,
             )
         setattr(text_encoder, "_anima_text_encoder_family", "qwen3.5")
-        setattr(text_encoder, "_anima_tokenizer_source", _QWEN35_TOKENIZER_SOURCE)
+        tokenizer_source = metadata.get("source_tokenizer", _QWEN35_TOKENIZER_SOURCE) if profile_format else _QWEN35_TOKENIZER_SOURCE
+        setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
     else:
-        state_dict = _strip_model_prefix(state_dict)
-        config = Qwen3Config(**QWEN3_06B_CONFIG)
+        if not profile_format:
+            state_dict = _strip_model_prefix(state_dict)
+        config = Qwen3Config(**(source_config or QWEN3_06B_CONFIG))
         text_encoder = Qwen3Model(config)
         missing, unexpected = text_encoder.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             raise RuntimeError(
-                "Text encoder weights do not match expected Qwen3-0.6B architecture. "
+                "Text encoder weights do not match expected Qwen3 architecture. "
                 f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
             )
         del state_dict
         setattr(text_encoder, "_anima_text_encoder_family", "qwen3")
-        setattr(text_encoder, "_anima_tokenizer_source", _QWEN_TOKENIZER_SOURCE)
+        tokenizer_source = metadata.get("source_tokenizer", _QWEN_TOKENIZER_SOURCE) if profile_format else _QWEN_TOKENIZER_SOURCE
+        setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
+
+    if profile_format:
+        # build_anima_pipeline sees this marker and automatically attaches the
+        # bridge from the same self-contained aligned-encoder artifact.
+        setattr(text_encoder, "_anima_embedded_bridge_path", str(file_path))
+        setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
 
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)
@@ -988,4 +1030,7 @@ def build_anima_pipeline(
         text_encoder_dtype=resolved_text_encoder_dtype,
         use_module_cpu_offload=False,
     )
+    embedded_bridge_path = getattr(text_encoder, "_anima_embedded_bridge_path", None)
+    if embedded_bridge_path:
+        runtime.load_text_encoder_bridge(embedded_bridge_path)
     return runtime

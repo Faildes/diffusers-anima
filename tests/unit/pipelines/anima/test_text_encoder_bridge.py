@@ -56,3 +56,28 @@ def test_qwen_source_is_not_capped_but_t5_queries_are_bounded_and_distributed():
     assert t5_ids[-1] == 999
     # Uniform query coverage includes content from the tail instead of only the first 511 IDs.
     assert max(t5_ids[:-1]) == 799
+
+
+def test_bridge_center_strength_zero_is_pure_rotation():
+    bridge = AnimaTextEncoderBridge(
+        rotation=torch.tensor([[0.0, -1.0], [1.0, 0.0]]),
+        source_mean=torch.tensor([100.0, 200.0]),
+        target_mean=torch.tensor([-5.0, -7.0]),
+        center_strength=0.0,
+        metadata={"format": "anima_text_encoder_profile_v2"},
+    )
+    hidden = torch.tensor([[[2.0, 3.0]]])
+    expected = hidden @ bridge.rotation
+    torch.testing.assert_close(bridge.apply(hidden), expected)
+
+
+def test_bridge_accepts_future_input_projection_shape():
+    bridge = AnimaTextEncoderBridge(
+        input_projection=torch.ones(3, 2),
+        rotation=torch.eye(2),
+        source_mean=torch.zeros(2),
+        target_mean=torch.zeros(2),
+        center_strength=1.0,
+    )
+    assert bridge.source_hidden_size == 3
+    assert bridge.bridge_hidden_size == 2

@@ -718,14 +718,22 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self,
         path: str | Path,
         *,
-        center_strength: float = 0.5,
-        variance_strength: float = 0.0,
+        center_strength: float | None = None,
+        variance_strength: float | None = None,
+        rms_strength: float | None = None,
+        strict_fingerprint: bool = True,
     ) -> "AnimaPipeline":
-        """Load a calibration bridge mapping the active Qwen encoder to Anima's Qwen3-0.6B space."""
+        """Load an encoder-compatibility profile for the active Qwen encoder.
+
+        For v2 profiles, omitted strengths use the values selected on the held-
+        out calibration split.  The same file may be a small bridge profile or a
+        self-contained aligned encoder artifact with embedded ``encoder.*`` weights.
+        """
         bridge = AnimaTextEncoderBridge.from_file(
             path,
             center_strength=center_strength,
             variance_strength=variance_strength,
+            rms_strength=rms_strength,
         )
         active_family = _active_text_encoder_family(self.text_encoder)
         bridge_source = str(bridge.metadata.get("source_family", "unknown"))
@@ -734,13 +742,26 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 "Text-encoder bridge source family does not match the active encoder: "
                 f"bridge={bridge_source!r}, active={active_family!r}."
             )
-        hidden_size = int(getattr(getattr(self.text_encoder, "config", None), "hidden_size", 0) or 0)
-        if hidden_size and hidden_size != bridge.hidden_size:
-            raise ValueError(
-                f"Text-encoder bridge hidden size {bridge.hidden_size} does not match active encoder {hidden_size}."
-            )
+        bridge.validate_encoder(self.text_encoder, strict_fingerprint=bool(strict_fingerprint))
         self.text_encoder_bridge = bridge
         return self
+
+    def describe_text_encoder_profile(self) -> dict[str, Any]:
+        """Describe the active encoder and its compatibility profile."""
+        family = _active_text_encoder_family(self.text_encoder)
+        config = getattr(self.text_encoder, "config", None)
+        result: dict[str, Any] = {
+            "encoder_family": family,
+            "encoder_hidden_size": int(getattr(config, "hidden_size", 0) or 0),
+            "bridge_attached": self.text_encoder_bridge is not None,
+        }
+        profile_metadata = getattr(self.text_encoder, "_anima_text_encoder_profile_metadata", None)
+        if isinstance(profile_metadata, dict):
+            result["encoder_artifact_kind"] = profile_metadata.get("artifact_kind", "unknown")
+            result["encoder_profile_format"] = profile_metadata.get("format", "unknown")
+        if self.text_encoder_bridge is not None:
+            result["bridge"] = self.text_encoder_bridge.describe()
+        return result
 
     def set_text_encoder_bridge(
         self, bridge: AnimaTextEncoderBridge | None
