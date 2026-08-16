@@ -66,6 +66,7 @@ from .strength_utils import (
     _trim_sigmas_by_strength,
 )
 from .text_encoding import (
+    _CONDITIONING_MAX_LENGTH,
     AnimaPromptTokenizer,
     build_condition,
     prepare_condition_inputs,
@@ -785,6 +786,22 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 "or both be None."
             )
         if prompt_embeds is not None:
+            if prompt_embeds.ndim != 3 or negative_prompt_embeds is None or negative_prompt_embeds.ndim != 3:
+                raise ValueError(
+                    "External Anima conditioning tensors must have shape (batch, sequence, hidden)."
+                )
+            if int(prompt_embeds.shape[1]) != _CONDITIONING_MAX_LENGTH:
+                raise ValueError(
+                    "External positive conditioning must be exactly 512 positions for Anima; "
+                    f"got {int(prompt_embeds.shape[1])}. Re-encode with strict_512/512-token budgeting."
+                )
+            if int(negative_prompt_embeds.shape[1]) != _CONDITIONING_MAX_LENGTH:
+                raise ValueError(
+                    "External negative conditioning must be exactly 512 positions for Anima; "
+                    f"got {int(negative_prompt_embeds.shape[1])}. Re-encode with strict_512/512-token budgeting."
+                )
+            if prompt_embeds.shape[0] != negative_prompt_embeds.shape[0]:
+                raise ValueError("Positive/negative conditioning batch sizes must match.")
             batch_size = prompt_embeds.shape[0]
         else:
             prompts, _ = _resolve_prompt_batches(
