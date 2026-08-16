@@ -1,6 +1,12 @@
 """Anima support utilities for Diffusers."""
 
-from .pipelines.anima import AnimaPipeline, AnimaPipelineOutput
+from .pipelines.anima import (
+    AnimaPipeline,
+    AnimaPipelineOutput,
+    AnimaPromptPlan,
+    AnimaPromptSpan,
+    AnimaTextEncoderBridge,
+)
 from .schedulers import AnimaFlowMatchEulerDiscreteScheduler, AnimaSamplingConfig
 
 
@@ -34,4 +40,7 @@ __all__ = [
     "AnimaPipeline",
     "AnimaPipelineOutput",
     "AnimaSamplingConfig",
+    "AnimaPromptPlan",
+    "AnimaPromptSpan",
+    "AnimaTextEncoderBridge",
 ]

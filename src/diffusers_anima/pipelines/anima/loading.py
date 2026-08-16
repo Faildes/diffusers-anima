@@ -32,6 +32,7 @@ from .constants import (
     LOCAL_QWEN_TOKENIZER_DIR,
     LOCAL_T5_TOKENIZER_DIR,
     QWEN3_06B_CONFIG,
+    QWEN35_08B_TEXT_CONFIG,
 )
 from .options import AnimaComponents, AnimaLoaderOptions, AnimaRuntimeOptions
 from .text_encoding import AnimaPromptTokenizer
@@ -46,6 +47,7 @@ _ANIMA_REPO = "hdae/diffusers-anima-preview"
 _TEXT_ENCODER_WEIGHTS = f"{_ANIMA_REPO}::text_encoder/model.safetensors"
 _TEXT_ENCODER_CONFIG_REPO = "Qwen/Qwen3-0.6B-Base"
 _QWEN_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_qwen"
+_QWEN35_TOKENIZER_SOURCE = "Qwen/Qwen3.5-0.8B-Base"
 _T5_TOKENIZER_SOURCE = f"{_ANIMA_REPO}::prompt_tokenizer_t5"
 _VAE_SOURCE = f"{_ANIMA_REPO}::vae/diffusion_pytorch_model.safetensors"
 
@@ -558,13 +560,60 @@ def load_vae_single_file(
     return vae
 
 
+def _detect_text_encoder_family(state_dict: dict[str, torch.Tensor]) -> str:
+    keys = tuple(state_dict.keys())
+    if any("linear_attn." in key for key in keys):
+        return "qwen3.5"
+    for candidate in (
+        "model.language_model.embed_tokens.weight",
+        "language_model.embed_tokens.weight",
+        "model.embed_tokens.weight",
+        "embed_tokens.weight",
+    ):
+        tensor = state_dict.get(candidate)
+        if tensor is not None and tensor.ndim == 2:
+            if int(tensor.shape[0]) == 248320:
+                return "qwen3.5"
+            if int(tensor.shape[0]) == 151936:
+                return "qwen3"
+    return "qwen3"
+
+
+def _extract_qwen35_text_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    prefixes = (
+        "model.language_model.",
+        "language_model.",
+        "model.",
+    )
+    for prefix in prefixes:
+        extracted = {
+            key[len(prefix):]: value
+            for key, value in state_dict.items()
+            if key.startswith(prefix) and not key.startswith(prefix + "visual.")
+        }
+        if "embed_tokens.weight" in extracted and any(
+            key.startswith("layers.") for key in extracted
+        ):
+            return extracted
+    if "embed_tokens.weight" in state_dict and any(
+        key.startswith("layers.") for key in state_dict
+    ):
+        return dict(state_dict)
+    raise RuntimeError(
+        "Could not find the Qwen3.5 text backbone in the supplied checkpoint. "
+        "Expected keys such as model.language_model.embed_tokens.weight."
+    )
+
+
 def load_text_encoder_single_file(
     file_path: str,
     *,
     device: str,
     dtype: torch.dtype,
     cache: bool = False,
-) -> Qwen3Model:
+) -> torch.nn.Module:
     if not Path(file_path).exists():
         raise FileNotFoundError(f"Anima text encoder checkpoint not found: {file_path}")
 
@@ -574,21 +623,58 @@ def load_text_encoder_single_file(
         if cached is not None:
             cached.eval().requires_grad_(False)
             cached.to(device=device, dtype=dtype)
-            return cached  # type: ignore[return-value]
+            return cached
 
     state_dict = load_file(file_path, device="cpu")
-    state_dict = _strip_model_prefix(state_dict)
-
-    config = Qwen3Config(**QWEN3_06B_CONFIG)
-
-    text_encoder = Qwen3Model(config)
-    missing, unexpected = text_encoder.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            "Text encoder weights do not match expected Qwen3-0.6B architecture. "
-            f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
-        )
-    del state_dict
+    family = _detect_text_encoder_family(state_dict)
+    if family == "qwen3.5":
+        try:
+            from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
+        except ImportError as exc:
+            raise ImportError(
+                "Qwen3.5 text-encoder loading requires a Transformers version "
+                "that provides Qwen3_5TextConfig/Qwen3_5TextModel. Upgrade transformers."
+            ) from exc
+        text_state = _extract_qwen35_text_state_dict(state_dict)
+        del state_dict
+        config = Qwen3_5TextConfig(**QWEN35_08B_TEXT_CONFIG)
+        text_encoder = Qwen3_5TextModel(config)
+        # Some official/full Qwen3.5 checkpoints place auxiliary MTP tensors
+        # under the language-model namespace. They are not part of TextModel and
+        # must not turn an otherwise valid text backbone into a load failure.
+        expected_keys = set(text_encoder.state_dict().keys())
+        filtered_text_state = {
+            key: value for key, value in text_state.items() if key in expected_keys
+        }
+        ignored_auxiliary = sorted(set(text_state) - set(filtered_text_state))
+        missing, unexpected = text_encoder.load_state_dict(filtered_text_state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Text encoder weights do not match expected Qwen3.5-0.8B text architecture. "
+                f"Missing: {len(missing)}, Unexpected: {len(unexpected)}; "
+                f"first missing={missing[:8]}, first unexpected={unexpected[:8]}"
+            )
+        if ignored_auxiliary:
+            warnings.warn(
+                "Ignored auxiliary Qwen3.5 tensors outside the text backbone: "
+                f"{len(ignored_auxiliary)} tensors (for example {ignored_auxiliary[:4]}).",
+                stacklevel=2,
+            )
+        setattr(text_encoder, "_anima_text_encoder_family", "qwen3.5")
+        setattr(text_encoder, "_anima_tokenizer_source", _QWEN35_TOKENIZER_SOURCE)
+    else:
+        state_dict = _strip_model_prefix(state_dict)
+        config = Qwen3Config(**QWEN3_06B_CONFIG)
+        text_encoder = Qwen3Model(config)
+        missing, unexpected = text_encoder.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Text encoder weights do not match expected Qwen3-0.6B architecture. "
+                f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
+            )
+        del state_dict
+        setattr(text_encoder, "_anima_text_encoder_family", "qwen3")
+        setattr(text_encoder, "_anima_tokenizer_source", _QWEN_TOKENIZER_SOURCE)
 
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)
@@ -605,7 +691,7 @@ def load_text_encoder(
     options: AnimaLoaderOptions,
     source: str = _TEXT_ENCODER_WEIGHTS,
     allow_remote_url: bool = False,
-) -> Qwen3Model:
+) -> torch.nn.Module:
     file_path = resolve_single_file_path(
         source,
         options=options,
@@ -872,8 +958,11 @@ def build_anima_pipeline(
         source=components.text_encoder_path or _TEXT_ENCODER_WEIGHTS,
         allow_remote_url=components.text_encoder_path is not None,
     )
+    qwen_tokenizer_source = str(
+        getattr(text_encoder, "_anima_tokenizer_source", _QWEN_TOKENIZER_SOURCE)
+    )
     prompt_tokenizer = load_prompt_tokenizer(
-        qwen_tokenizer_source=_QWEN_TOKENIZER_SOURCE,
+        qwen_tokenizer_source=qwen_tokenizer_source,
         t5_tokenizer_source=_T5_TOKENIZER_SOURCE,
         options=load_options,
     )

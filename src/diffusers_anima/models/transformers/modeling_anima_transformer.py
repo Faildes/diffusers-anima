@@ -47,6 +47,33 @@ def _build_position_ids(
     return base.unsqueeze(0).expand(batch_size, -1)
 
 
+def _build_source_position_ids(
+    batch_size: int,
+    length: int,
+    device: torch.device,
+    *,
+    trained_length: int = 512,
+) -> torch.Tensor:
+    """Keep long source memory inside the adapter's trained RoPE position range.
+
+    The Qwen encoder may expose more than 512 source tokens.  The adapter was
+    trained with a bounded conditioning window, so raw source positions far past
+    that range would introduce a second out-of-distribution change on top of the
+    alternate encoder.  For long sources we retain every key/value token but
+    continuously compress their adapter-side RoPE coordinates into [0, 511].
+    """
+    if length <= int(trained_length):
+        return _build_position_ids(batch_size, length, device)
+    base = torch.linspace(
+        0.0,
+        float(int(trained_length) - 1),
+        steps=int(length),
+        device=device,
+        dtype=torch.float32,
+    )
+    return base.unsqueeze(0).expand(batch_size, -1)
+
+
 def _pad_to_length(hidden_states: torch.Tensor, target_length: int) -> torch.Tensor:
     pad_tokens = target_length - hidden_states.shape[1]
     if pad_tokens <= 0:
@@ -258,6 +285,8 @@ class _LLMAdapter(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.norm = _AnimaRMSNorm(dim)
         self.rope = _RotaryEmbedding(dim // heads)
+        # Runtime-only compatibility policy. No weights depend on this flag.
+        self.source_position_mode = "compress"
 
     def forward(
         self,
@@ -277,11 +306,19 @@ class _LLMAdapter(nn.Module):
             length=target_hidden_states.shape[1],
             device=target_hidden_states.device,
         )
-        source_position_ids = _build_position_ids(
-            batch_size=source_context.shape[0],
-            length=source_context.shape[1],
-            device=source_context.device,
-        )
+        if self.source_position_mode == "raw":
+            source_position_ids = _build_position_ids(
+                batch_size=source_context.shape[0],
+                length=source_context.shape[1],
+                device=source_context.device,
+            )
+        else:
+            source_position_ids = _build_source_position_ids(
+                batch_size=source_context.shape[0],
+                length=source_context.shape[1],
+                device=source_context.device,
+                trained_length=512,
+            )
 
         target_position_embed = self.rope(target_hidden_states, target_position_ids)
         source_position_embed = self.rope(source_context, source_position_ids)
@@ -349,13 +386,29 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         text_embeds: torch.Tensor,
         text_ids: torch.Tensor | None,
         t5xxl_weights: torch.Tensor | None = None,
+        source_attention_mask: torch.Tensor | None = None,
+        target_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_ids is None:
             return text_embeds
 
-        adapted = self.llm_adapter(text_embeds, text_ids)
+        # Qwen source memory may be longer than 512.  Only the T5/query/output
+        # side is constrained to Anima's trained 512-position contract.
+        if text_ids.shape[1] > 512:
+            text_ids = text_ids[:, :512]
+            if t5xxl_weights is not None:
+                t5xxl_weights = t5xxl_weights[:, :512]
+            if target_attention_mask is not None:
+                target_attention_mask = target_attention_mask[:, :512]
+        adapted = self.llm_adapter(
+            text_embeds,
+            text_ids,
+            target_attention_mask=target_attention_mask,
+            source_attention_mask=source_attention_mask,
+        )
         if t5xxl_weights is not None:
             adapted = adapted * t5xxl_weights
+        adapted = adapted[:, :512]
         return _pad_to_length(adapted, 512)
 
     def forward(

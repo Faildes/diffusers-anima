@@ -69,7 +69,9 @@ from .text_encoding import (
     AnimaPromptTokenizer,
     build_condition,
     prepare_condition_inputs,
+    prepare_condition_inputs_from_plans,
 )
+from .text_encoder_bridge import AnimaTextEncoderBridge
 from .validation import (
     ImageBatchInput,
     PromptInput,
@@ -146,6 +148,18 @@ def _resolve_effective_cfg_batch_mode(cfg_batch_mode: str, *, execution_device: 
     return cfg_batch_mode
 
 
+def _active_text_encoder_family(text_encoder: torch.nn.Module) -> str:
+    tagged = getattr(text_encoder, "_anima_text_encoder_family", None)
+    if tagged:
+        return str(tagged)
+    model_type = str(getattr(getattr(text_encoder, "config", None), "model_type", ""))
+    if model_type == "qwen3_5_text":
+        return "qwen3.5"
+    if model_type == "qwen3":
+        return "qwen3"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Internal image generation routine
 # ---------------------------------------------------------------------------
@@ -157,12 +171,8 @@ def _prepare_prompt_embedding_inputs(
     prompt: list[str],
     negative_prompt: list[str] | None,
 ) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None,
 ]:
     with _module_execution_context(
         pipe.text_encoder,
@@ -176,30 +186,40 @@ def _prepare_prompt_embedding_inputs(
                 "Load the pipeline via from_pretrained, from_single_file, or "
                 "from_multiple_files to ensure the tokenizer is initialised automatically."
             )
-        pos_hidden, pos_t5_ids, pos_t5_weights = prepare_condition_inputs(
+        family = _active_text_encoder_family(pipe.text_encoder)
+        if family == "qwen3.5" and pipe.text_encoder_bridge is None and not getattr(pipe, "_anima_warned_missing_bridge", False):
+            warnings.warn(
+                "Qwen3.5 is shape-compatible with Anima but its hidden representation is not the "
+                "Qwen3-0.6B space used to train the LLM adapter. Calibrate/load an "
+                "AnimaTextEncoderBridge for production use.",
+                stacklevel=2,
+            )
+            pipe._anima_warned_missing_bridge = True
+        pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_mask, pos_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
             pipe.text_encoder,
             prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
+            bridge=pipe.text_encoder_bridge,
         )
         if negative_prompt is None:
-            return pos_hidden, pos_t5_ids, pos_t5_weights, None, None, None
-        neg_hidden, neg_t5_ids, neg_t5_weights = prepare_condition_inputs(
+            return (
+                pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_mask, pos_t5_weights,
+                None, None, None, None, None,
+            )
+        neg_hidden, neg_qwen_mask, neg_t5_ids, neg_t5_mask, neg_t5_weights = prepare_condition_inputs(
             pipe.prompt_tokenizer,
             pipe.text_encoder,
             negative_prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
+            bridge=pipe.text_encoder_bridge,
         )
 
     return (
-        pos_hidden,
-        pos_t5_ids,
-        pos_t5_weights,
-        neg_hidden,
-        neg_t5_ids,
-        neg_t5_weights,
+        pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_mask, pos_t5_weights,
+        neg_hidden, neg_qwen_mask, neg_t5_ids, neg_t5_mask, neg_t5_weights,
     )
 
 
@@ -207,16 +227,22 @@ def _build_cfg_conditions_from_embeddings(
     pipe: "AnimaPipeline",
     *,
     pos_hidden: torch.Tensor,
+    pos_qwen_mask: torch.Tensor | None,
     pos_t5_ids: torch.Tensor,
+    pos_t5_mask: torch.Tensor | None,
     pos_t5_weights: torch.Tensor,
     neg_hidden: torch.Tensor | None,
+    neg_qwen_mask: torch.Tensor | None,
     neg_t5_ids: torch.Tensor | None,
+    neg_t5_mask: torch.Tensor | None,
     neg_t5_weights: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     pos_cond = build_condition(
         pipe.transformer,
         qwen_hidden=pos_hidden,
+        qwen_mask=pos_qwen_mask,
         t5_ids=pos_t5_ids,
+        t5_mask=pos_t5_mask,
         t5_weights=pos_t5_weights,
     )
     if neg_hidden is None or neg_t5_ids is None or neg_t5_weights is None:
@@ -224,10 +250,48 @@ def _build_cfg_conditions_from_embeddings(
     neg_cond = build_condition(
         pipe.transformer,
         qwen_hidden=neg_hidden,
+        qwen_mask=neg_qwen_mask,
         t5_ids=neg_t5_ids,
+        t5_mask=neg_t5_mask,
         t5_weights=neg_t5_weights,
     )
     return pos_cond, neg_cond
+
+
+def _encode_prompt_plan_batch(
+    pipe: "AnimaPipeline",
+    plans: list[Any],
+) -> torch.Tensor:
+    if pipe.prompt_tokenizer is None:
+        raise RuntimeError("AnimaPipeline requires a prompt_tokenizer for prompt plans.")
+    with _module_execution_context(
+        pipe.text_encoder,
+        execution_device=pipe.execution_device,
+        execution_dtype=pipe.text_encoder_dtype,
+        enable_offload=pipe.use_module_cpu_offload,
+    ):
+        hidden, qwen_mask, t5_ids, t5_mask, t5_weights = prepare_condition_inputs_from_plans(
+            pipe.prompt_tokenizer,
+            pipe.text_encoder,
+            plans,
+            execution_device=pipe.execution_device,
+            model_dtype=pipe.model_dtype,
+            bridge=pipe.text_encoder_bridge,
+        )
+    with _module_execution_context(
+        pipe.transformer,
+        execution_device=pipe.execution_device,
+        execution_dtype=pipe.model_dtype,
+        enable_offload=pipe.use_module_cpu_offload,
+    ):
+        return build_condition(
+            pipe.transformer,
+            qwen_hidden=hidden,
+            qwen_mask=qwen_mask,
+            t5_ids=t5_ids,
+            t5_mask=t5_mask,
+            t5_weights=t5_weights,
+        )
 
 
 def _prepare_init_image_latents_and_inpaint_mask(
@@ -344,8 +408,8 @@ def _generate_image(
     )
     if prompt_embeds is not None:
         batch_size = prompt_embeds.shape[0]
-        pos_hidden = pos_t5_ids = pos_t5_weights = None
-        neg_hidden = neg_t5_ids = neg_t5_weights = None
+        pos_hidden = pos_qwen_mask = pos_t5_ids = pos_t5_mask = pos_t5_weights = None
+        neg_hidden = neg_qwen_mask = neg_t5_ids = neg_t5_mask = neg_t5_weights = None
     else:
         prompts, negative_prompts = _resolve_prompt_batches(
             prompt=prompt,
@@ -353,12 +417,13 @@ def _generate_image(
             num_images_per_prompt=num_images_per_prompt,
         )
         batch_size = len(prompts)
-        pos_hidden, pos_t5_ids, pos_t5_weights, neg_hidden, neg_t5_ids, neg_t5_weights = (
-            _prepare_prompt_embedding_inputs(
-                pipe,
-                prompt=prompts,
-                negative_prompt=negative_prompts if use_cfg else None,
-            )
+        (
+            pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_mask, pos_t5_weights,
+            neg_hidden, neg_qwen_mask, neg_t5_ids, neg_t5_mask, neg_t5_weights,
+        ) = _prepare_prompt_embedding_inputs(
+            pipe,
+            prompt=prompts,
+            negative_prompt=negative_prompts if use_cfg else None,
         )
 
     height, width, latent_h, latent_w = latent_hw(
@@ -498,10 +563,14 @@ def _generate_image(
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 pipe,
                 pos_hidden=pos_hidden,
+                pos_qwen_mask=pos_qwen_mask,
                 pos_t5_ids=pos_t5_ids,
+                pos_t5_mask=pos_t5_mask,
                 pos_t5_weights=pos_t5_weights,
                 neg_hidden=neg_hidden,
+                neg_qwen_mask=neg_qwen_mask,
                 neg_t5_ids=neg_t5_ids,
+                neg_t5_mask=neg_t5_mask,
                 neg_t5_weights=neg_t5_weights,
             )
 
@@ -639,8 +708,90 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.model_dtype = model_dtype
         self.text_encoder_dtype = text_encoder_dtype
         self.use_module_cpu_offload = use_module_cpu_offload
+        # Runtime-only representation bridge. It is intentionally not registered
+        # as a Diffusers module or persisted with the pipeline.
+        self.text_encoder_bridge: AnimaTextEncoderBridge | None = None
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
+
+    def load_text_encoder_bridge(
+        self,
+        path: str | Path,
+        *,
+        center_strength: float = 0.5,
+        variance_strength: float = 0.0,
+    ) -> "AnimaPipeline":
+        """Load a calibration bridge mapping the active Qwen encoder to Anima's Qwen3-0.6B space."""
+        bridge = AnimaTextEncoderBridge.from_file(
+            path,
+            center_strength=center_strength,
+            variance_strength=variance_strength,
+        )
+        active_family = _active_text_encoder_family(self.text_encoder)
+        bridge_source = str(bridge.metadata.get("source_family", "unknown"))
+        if bridge_source not in {"", "unknown", active_family}:
+            raise ValueError(
+                "Text-encoder bridge source family does not match the active encoder: "
+                f"bridge={bridge_source!r}, active={active_family!r}."
+            )
+        hidden_size = int(getattr(getattr(self.text_encoder, "config", None), "hidden_size", 0) or 0)
+        if hidden_size and hidden_size != bridge.hidden_size:
+            raise ValueError(
+                f"Text-encoder bridge hidden size {bridge.hidden_size} does not match active encoder {hidden_size}."
+            )
+        self.text_encoder_bridge = bridge
+        return self
+
+    def set_text_encoder_bridge(
+        self, bridge: AnimaTextEncoderBridge | None
+    ) -> "AnimaPipeline":
+        self.text_encoder_bridge = bridge
+        return self
+
+    def clear_text_encoder_bridge(self) -> "AnimaPipeline":
+        if self.text_encoder_bridge is not None:
+            self.text_encoder_bridge.clear_runtime_cache()
+        self.text_encoder_bridge = None
+        return self
+
+    def set_qwen_source_max_length(self, max_length: int | None) -> "AnimaPipeline":
+        """Optionally cap only the Qwen source-memory length; None keeps it unrestricted by Anima."""
+        if self.prompt_tokenizer is None:
+            raise RuntimeError("prompt_tokenizer is not initialised")
+        if max_length is not None and int(max_length) < 1:
+            raise ValueError("max_length must be >= 1 or None")
+        self.prompt_tokenizer.qwen_source_max_length = (
+            None if max_length is None else int(max_length)
+        )
+        return self
+
+    def set_t5_query_strategy(self, strategy: str) -> "AnimaPipeline":
+        """Choose how the bounded T5/query side covers an overlength prompt.
+
+        ``"uniform"`` (default) samples query tokens across the complete text,
+        while ``"head"`` reproduces ordinary first-511-token truncation. The
+        Qwen source memory is independent and is never shortened by this option.
+        """
+        if self.prompt_tokenizer is None:
+            raise RuntimeError("prompt_tokenizer is not initialised")
+        normalized = str(strategy).strip().lower()
+        if normalized not in {"head", "uniform"}:
+            raise ValueError("strategy must be 'head' or 'uniform'")
+        self.prompt_tokenizer.t5_query_strategy = normalized
+        return self
+
+    def set_adapter_source_position_mode(self, mode: str) -> "AnimaPipeline":
+        """Control adapter-side RoPE positions for Qwen source memories longer than 512.
+
+        ``"compress"`` keeps every source KV token but maps its adapter RoPE
+        coordinate into the original 0..511 range. ``"raw"`` uses monotonically
+        increasing positions beyond 511 for research / A-B comparison.
+        """
+        normalized = str(mode).strip().lower()
+        if normalized not in {"compress", "raw"}:
+            raise ValueError("mode must be 'compress' or 'raw'")
+        self.transformer.llm_adapter.source_position_mode = normalized
+        return self
 
     @property
     def execution_device(self) -> str:
@@ -755,6 +906,35 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         )
 
     @torch.inference_mode()
+    def encode_prompt_plan(
+        self,
+        prompt_plan: Any | list[Any],
+        negative_prompt_plan: Any | list[Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode sd_embed-style structured plans without building/mixing separate conditions.
+
+        Each plan contains one full visible text plus character-span factors.
+        AND/BREAK are metadata/group boundaries inside that single memory rather
+        than requests to create multiple completed conditioning tensors.
+        """
+        pos_plans = prompt_plan if isinstance(prompt_plan, list) else [prompt_plan]
+        if negative_prompt_plan is None:
+            neg_plans = [{"text": "", "spans": []} for _ in pos_plans]
+        else:
+            neg_plans = (
+                negative_prompt_plan
+                if isinstance(negative_prompt_plan, list)
+                else [negative_prompt_plan]
+            )
+            if len(neg_plans) == 1 and len(pos_plans) > 1:
+                neg_plans = neg_plans * len(pos_plans)
+            if len(neg_plans) != len(pos_plans):
+                raise ValueError("positive/negative prompt-plan batch sizes must match")
+        pos_cond = _encode_prompt_plan_batch(self, list(pos_plans))
+        neg_cond = _encode_prompt_plan_batch(self, list(neg_plans))
+        return pos_cond, neg_cond
+
+    @torch.inference_mode()
     def encode_prompt(
         self,
         prompt: PromptInput,
@@ -790,12 +970,13 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             negative_prompt=negative_prompt,
             num_images_per_prompt=num_images_per_prompt,
         )
-        pos_hidden, pos_t5_ids, pos_t5_weights, neg_hidden, neg_t5_ids, neg_t5_weights = (
-            _prepare_prompt_embedding_inputs(
-                self,
-                prompt=prompts,
-                negative_prompt=negative_prompts,
-            )
+        (
+            pos_hidden, pos_qwen_mask, pos_t5_ids, pos_t5_mask, pos_t5_weights,
+            neg_hidden, neg_qwen_mask, neg_t5_ids, neg_t5_mask, neg_t5_weights,
+        ) = _prepare_prompt_embedding_inputs(
+            self,
+            prompt=prompts,
+            negative_prompt=negative_prompts,
         )
         with _module_execution_context(
             self.transformer,
@@ -806,10 +987,14 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 self,
                 pos_hidden=pos_hidden,
+                pos_qwen_mask=pos_qwen_mask,
                 pos_t5_ids=pos_t5_ids,
+                pos_t5_mask=pos_t5_mask,
                 pos_t5_weights=pos_t5_weights,
                 neg_hidden=neg_hidden,
+                neg_qwen_mask=neg_qwen_mask,
                 neg_t5_ids=neg_t5_ids,
+                neg_t5_mask=neg_t5_mask,
                 neg_t5_weights=neg_t5_weights,
             )
         return pos_cond, neg_cond
@@ -1315,7 +1500,8 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """Load Anima from separate transformer, text encoder, and VAE files.
 
         ``model_path`` points to the Anima transformer checkpoint,
-        ``encoder_path`` points to the Qwen3-0.6B text encoder checkpoint, and
+        ``encoder_path`` points to a supported Qwen text encoder checkpoint
+        (Qwen3-0.6B or Qwen3.5-0.8B text backbone), and
         ``vae_path`` points to the Anima VAE checkpoint. Each path accepts the
         same source forms as ``from_single_file``: a local file,
         ``repo_id::filename``, or a Hugging Face file URL.
