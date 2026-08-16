@@ -679,7 +679,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self,
         *,
         mode: str = "auto",
-        target_t5_tokens: int = 192,
+        target_t5_tokens: int = 256,
         qwen_input_max_tokens: int = 8192,
         compiler_max_new_tokens: int = 256,
         system_prompt: str | None = None,

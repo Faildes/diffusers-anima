@@ -187,7 +187,7 @@ class AnimaSemanticPromptFrontend:
         pipe: Any,
         *,
         mode: str = PROMPT_MODE_AUTO,
-        target_t5_tokens: int = 480,
+        target_t5_tokens: int = 256,
         qwen_input_max_tokens: int = 8192,
         compiler_max_new_tokens: int = 640,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
