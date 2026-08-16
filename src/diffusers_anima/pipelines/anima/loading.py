@@ -703,6 +703,17 @@ def load_text_encoder_single_file(
         "_anima_text_encoder_profile",
         "qwen3.5-0.8b-base" if family == "qwen3.5" else "qwen3-0.6b-base",
     )
+    # The Anima LLM adapter was learned with Qwen3-0.6B-Base representations.
+    # Qwen3.5 is shape-compatible (1024 hidden dims) but not representation-
+    # identical, so use a conservative source-value gate by default.  Scaling
+    # the source before the adapter leaves its RMS-normalized key directions
+    # largely intact while damping the uncalibrated value residual.  Users can
+    # override this at runtime via pipe.set_text_encoder_conditioning_scale().
+    setattr(
+        text_encoder,
+        "_anima_conditioning_source_scale",
+        0.80 if family == "qwen3.5" else 1.0,
+    )
     # Text-encoder generation is intentionally independent of Anima transformer
     # depth. Any supported encoder family can be paired with either 28-block
     # Anima or 40-block Anima 2.9B because both expose 1024-d hidden states.

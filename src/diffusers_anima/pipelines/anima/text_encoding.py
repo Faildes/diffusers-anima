@@ -22,6 +22,11 @@ _QWEN3_DEFAULT_PAD_TOKEN_ID: int = 151643
 
 # Maximum sequence length the LLM adapter conditioning tensor is padded / truncated to.
 _CONDITIONING_MAX_LENGTH: int = 512
+# Training-free compatibility gate used when Qwen3.5 replaces the original
+# Qwen3-0.6B-Base source encoder.  The adapter was not trained on Qwen3.5's
+# representation basis, so a modest value-residual attenuation is safer than
+# feeding the replacement encoder at full strength.
+_QWEN35_DEFAULT_SOURCE_SCALE: float = 0.80
 
 
 class AnimaPromptTokenizer:
@@ -43,11 +48,15 @@ class AnimaPromptTokenizer:
     def tokenize_with_weights(
         self, text: str
     ) -> dict[str, list[list[tuple[int, float]]]]:
+        # Native Anima conditioning is a 512-position contract.  Truncate at
+        # tokenization time instead of encoding an overlength source and only
+        # cropping the adapter output afterwards.  T5 reserves one slot for EOS.
         qwen_ids = (
             self.qwen_tokenizer(
                 [text],
                 add_special_tokens=False,
-                truncation=False,
+                truncation=True,
+                max_length=_CONDITIONING_MAX_LENGTH,
                 return_tensors="pt",
             )
             .input_ids[0]
@@ -57,7 +66,8 @@ class AnimaPromptTokenizer:
             self.t5_tokenizer(
                 [text],
                 add_special_tokens=False,
-                truncation=False,
+                truncation=True,
+                max_length=_CONDITIONING_MAX_LENGTH - 1,
                 return_tensors="pt",
             )
             .input_ids[0]
@@ -125,6 +135,29 @@ def resolve_text_encoder_backbone(text_encoder: "PreTrainedModel") -> "PreTraine
     return text_encoder
 
 
+def resolve_text_encoder_conditioning_scale(text_encoder: "PreTrainedModel") -> float:
+    """Return the source-value scale used before Anima's learned LLM adapter.
+
+    Qwen3-0.6B keeps the exact historical path (1.0).  Qwen3.5 defaults to a
+    conservative 0.80 because hidden-size compatibility does not imply a shared
+    representation basis.  The value is stored on the encoder so a pipeline can
+    override it without introducing another learned model.
+    """
+    value = getattr(text_encoder, "_anima_conditioning_source_scale", None)
+    if value is None:
+        family = str(getattr(text_encoder, "_anima_text_encoder_family", ""))
+        model_type = str(getattr(getattr(text_encoder, "config", None), "model_type", ""))
+        is_qwen35 = family == "qwen3.5" or "qwen3_5" in model_type or "qwen3.5" in model_type
+        value = _QWEN35_DEFAULT_SOURCE_SCALE if is_qwen35 else 1.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 1.0
+    if not torch.isfinite(torch.tensor(value)) or value < 0.0:
+        raise ValueError("Anima text-encoder conditioning scale must be a finite value >= 0.")
+    return value
+
+
 def prepare_condition_inputs(
     prompt_tokenizer: AnimaPromptTokenizer,
     text_encoder: "PreTrainedModel",
@@ -164,6 +197,9 @@ def prepare_condition_inputs(
         qwen_pairs = tokenized.get("qwen", tokenized["qwen3_06b"])[0]
         qwen_token_ids, _ = _extract_ids_and_weights(qwen_pairs)
         t5_token_ids, t5_token_weights = _extract_ids_and_weights(tokenized["t5xxl"][0])
+        qwen_token_ids = qwen_token_ids[:_CONDITIONING_MAX_LENGTH]
+        t5_token_ids = t5_token_ids[:_CONDITIONING_MAX_LENGTH]
+        t5_token_weights = t5_token_weights[:_CONDITIONING_MAX_LENGTH]
 
         if len(qwen_token_ids) == 0:
             qwen_token_ids = [int(qwen_pad)]
@@ -223,6 +259,9 @@ def prepare_condition_inputs(
         else:
             qwen_hidden = text_encoder_out.last_hidden_state
         qwen_hidden = qwen_hidden.to(model_dtype)
+        source_scale = resolve_text_encoder_conditioning_scale(text_encoder)
+        if source_scale != 1.0:
+            qwen_hidden = qwen_hidden * source_scale
     return qwen_hidden, qwen_mask, t5_ids, t5_weights
 
 

@@ -674,6 +674,28 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.prompt_processor = None
         return self
 
+    def set_text_encoder_conditioning_scale(self, scale: float) -> "AnimaPipeline":
+        """Set the source-value gate applied before the Anima LLM adapter.
+
+        ``1.0`` is the historical Qwen3-0.6B path. Qwen3.5 raw-file loaders
+        default to ``0.80`` to reduce representation-basis drift without
+        changing tokenizer IDs, model weights, or the 512-position contract.
+        """
+        scale = float(scale)
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError("text encoder conditioning scale must be finite and >= 0")
+        setattr(self.text_encoder, "_anima_conditioning_source_scale", scale)
+        return self
+
+    @property
+    def text_encoder_conditioning_scale(self) -> float:
+        value = getattr(self.text_encoder, "_anima_conditioning_source_scale", None)
+        if value is not None:
+            return float(value)
+        family = str(getattr(self.text_encoder, "_anima_text_encoder_family", ""))
+        model_type = str(getattr(getattr(self.text_encoder, "config", None), "model_type", ""))
+        return 0.80 if family == "qwen3.5" or "qwen3_5" in model_type or "qwen3.5" in model_type else 1.0
+
     def _process_prompt_batch(self, prompts: list[str], *, negative: bool) -> list[str]:
         processor = getattr(self, "prompt_processor", None)
         if processor is None:
