@@ -118,6 +118,14 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/text_encoder_profiles.md`](docs/text_encoder_profiles.md) | Qwen3.5/alternate encoder compatibility profile format |
 | [`docs/final_encoder_v4_stability.md`](docs/final_encoder_v4_stability.md) | v3 final encoder + v4 saturation/binding stability layer |
 
+## Long prompts beyond 512 tokens
+
+v5 keeps Anima's trained 512-slot target conditioning contract but removes the
+512-token **source-memory cliff** inside the frozen LLM adapter. Long Qwen
+memories are handled by overlapping native-size attention banks plus a
+per-query bank router, instead of one >512-key softmax with compressed RoPE.
+See [`docs/long_context_v5.md`](docs/long_context_v5.md).
+
 ## Experimental aligned text-encoder profiles
 
 Anima's LLM adapter was trained against Qwen3-0.6B hidden states. Alternate

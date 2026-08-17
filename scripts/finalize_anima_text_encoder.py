@@ -63,6 +63,8 @@ class FinalEncoderConfig:
     semantic_expansion_group_aware: bool = True
     semantic_expansion_coherence_power: float = 1.0
     semantic_expansion_min_coherence: float = 0.15
+    semantic_expansion_preserve_native_window: bool = True
+    semantic_expansion_native_window: int = 512
     # v4 final-runtime stability defaults. Calibration metrics are preserved
     # separately; these values are chosen for token-level image stability.
     final_center_strength: float = 1.0
@@ -86,6 +88,8 @@ class FinalEncoderConfig:
             semantic_expansion_group_aware=bool(self.semantic_expansion_group_aware),
             semantic_expansion_coherence_power=float(self.semantic_expansion_coherence_power),
             semantic_expansion_min_coherence=float(self.semantic_expansion_min_coherence),
+            semantic_expansion_preserve_native_window=bool(self.semantic_expansion_preserve_native_window),
+            semantic_expansion_native_window=int(self.semantic_expansion_native_window),
             final_center_strength=float(self.final_center_strength),
             final_variance_strength=float(self.final_variance_strength),
             final_rms_strength=float(self.final_rms_strength),
@@ -190,6 +194,9 @@ def finalize_anima_text_encoder(config: FinalEncoderConfig) -> FinalEncoderResul
         "semantic_expansion_group_aware": "true" if config.semantic_expansion_group_aware else "false",
         "semantic_expansion_coherence_power": f"{max(0.0, config.semantic_expansion_coherence_power):.8g}",
         "semantic_expansion_min_coherence": f"{max(0.0, min(1.0, config.semantic_expansion_min_coherence)):.8g}",
+        "semantic_expansion_preserve_native_window": "true" if config.semantic_expansion_preserve_native_window else "false",
+        "semantic_expansion_native_window": str(max(1, config.semantic_expansion_native_window)),
+        "long_context_profile": "windowed_source_router_v5",
         "stability_profile": "binding_preserving_v4",
         "final_center_strength": f"{config.final_center_strength:.8g}",
         "final_variance_strength": f"{config.final_variance_strength:.8g}",
@@ -200,7 +207,7 @@ def finalize_anima_text_encoder(config: FinalEncoderConfig) -> FinalEncoderResul
         "final_token_rms_max_ratio": f"{max(config.final_token_rms_min_ratio, config.final_token_rms_max_ratio):.8g}",
         "calibration_recommended_center_strength": md.get("recommended_center_strength", "unknown"),
         "calibration_recommended_variance_strength": md.get("recommended_variance_strength", "unknown"),
-        "finalization_policy": "preserve_source_backbone_add_anima_head_binding_stability_v4",
+        "finalization_policy": "preserve_source_backbone_add_anima_head_binding_stability_v4_long_context_v5",
         "parent_profile_format": md.get("format", "unknown"),
         "parent_artifact_kind": md.get("artifact_kind", "unknown"),
     })
@@ -231,6 +238,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--semantic-expansion-group-aware", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--semantic-expansion-coherence-power", type=float, default=1.0)
     p.add_argument("--semantic-expansion-min-coherence", type=float, default=0.15)
+    p.add_argument("--semantic-expansion-preserve-native-window", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--semantic-expansion-native-window", type=int, default=512)
     p.add_argument("--final-center-strength", type=float, default=1.0)
     p.add_argument("--final-variance-strength", type=float, default=0.0)
     p.add_argument("--final-rms-strength", type=float, default=0.0)
@@ -255,6 +264,8 @@ def main() -> None:
         semantic_expansion_group_aware=a.semantic_expansion_group_aware,
         semantic_expansion_coherence_power=a.semantic_expansion_coherence_power,
         semantic_expansion_min_coherence=a.semantic_expansion_min_coherence,
+        semantic_expansion_preserve_native_window=a.semantic_expansion_preserve_native_window,
+        semantic_expansion_native_window=a.semantic_expansion_native_window,
         final_center_strength=a.final_center_strength,
         final_variance_strength=a.final_variance_strength,
         final_rms_strength=a.final_rms_strength,

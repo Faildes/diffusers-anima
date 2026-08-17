@@ -57,3 +57,16 @@ def test_v4_group_aware_expansion_keeps_groups_as_separate_slots():
     # One semantic slot for each contiguous PromptPlan group.
     assert out.shape == (1, 6, 4)
     assert out_mask.tolist() == [[1, 1, 1, 1, 1, 1]]
+
+
+def test_v5_short_source_semantic_slots_do_not_cross_native_window():
+    cond = _conditioner(0.25)
+    cond.semantic_expansion_max_tokens = 16
+    cond.semantic_expansion_chunk_size = 64
+    cond.semantic_expansion_native_window = 512
+    cond.semantic_expansion_preserve_native_window = True
+    x = torch.randn(1, 511, 4)
+    mask = torch.ones(1, 511, dtype=torch.long)
+    out, out_mask = cond.build_memory(x, mask)
+    assert out.shape[1] == 512
+    assert out_mask.shape[1] == 512

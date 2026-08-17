@@ -74,6 +74,34 @@ def _build_source_position_ids(
     return base.unsqueeze(0).expand(batch_size, -1)
 
 
+def _build_long_context_window_starts(
+    length: int,
+    *,
+    window_size: int,
+    overlap: int,
+) -> list[int]:
+    """Return monotonically increasing source-window starts with no gaps.
+
+    The long-source path intentionally keeps each cross-attention competition
+    inside a window no larger than the adapter's native 512-token training
+    range.  A modest overlap protects concepts that cross a boundary.
+    """
+    length = int(length)
+    window_size = max(1, int(window_size))
+    overlap = max(0, min(int(overlap), window_size - 1))
+    if length <= window_size:
+        return [0]
+    stride = max(1, window_size - overlap)
+    starts: list[int] = []
+    start = 0
+    while start < length:
+        starts.append(start)
+        if start + window_size >= length:
+            break
+        start += stride
+    return starts
+
+
 def _pad_to_length(hidden_states: torch.Tensor, target_length: int) -> torch.Tensor:
     pad_tokens = target_length - hidden_states.shape[1]
     if pad_tokens <= 0:
@@ -191,22 +219,14 @@ class _AdapterAttention(nn.Module):
         self.k_norm = _AnimaRMSNorm(head_dim)
         self.o_proj = nn.Linear(inner, query_dim, bias=False)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        context: torch.Tensor | None = None,
-        attn_mask: torch.Tensor | None = None,
-        pos_q: tuple[torch.Tensor, torch.Tensor] | None = None,
-        pos_k: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        context = x if context is None else context
-
-        q = (
+    def _project_query(self, x: torch.Tensor) -> torch.Tensor:
+        return (
             self.q_proj(x)
             .view(x.shape[0], x.shape[1], self.heads, self.head_dim)
             .transpose(1, 2)
         )
+
+    def _project_key_value(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         k = (
             self.k_proj(context)
             .view(context.shape[0], context.shape[1], self.heads, self.head_dim)
@@ -217,14 +237,162 @@ class _AdapterAttention(nn.Module):
             .view(context.shape[0], context.shape[1], self.heads, self.head_dim)
             .transpose(1, 2)
         )
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        return self.k_norm(k), v
 
-        if pos_q is not None and pos_k is not None:
+    def _windowed_source_attention(
+        self,
+        q: torch.Tensor,
+        *,
+        context: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        rope: _RotaryEmbedding,
+        window_size: int,
+        overlap: int,
+        router_top_k: int,
+        router_temperature: float,
+        locality_strength: float,
+    ) -> torch.Tensor:
+        """Attend to arbitrary source length through native-size memory banks.
+
+        A single global softmax over >512 source tokens changes the entropy and
+        positional regime that the frozen Anima adapter saw during training.
+        Instead, every bank performs ordinary <=512-token attention with local
+        RoPE positions.  A second, length-normalised router chooses a small
+        number of relevant banks per target token/head.  The result still has
+        the native target length, so the downstream DiT contract is unchanged.
+        """
+        source_len = int(context.shape[1])
+        starts = _build_long_context_window_starts(
+            source_len, window_size=int(window_size), overlap=int(overlap)
+        )
+        if len(starts) <= 1:
+            k, v = self._project_key_value(context)
+            local_ids = _build_position_ids(context.shape[0], context.shape[1], context.device)
+            k = _apply_rope(k, *rope(context, local_ids))
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            return y
+
+        q_len = int(q.shape[-2])
+        q_rel = torch.linspace(
+            0.0, 1.0, steps=max(1, q_len), device=q.device, dtype=torch.float32
+        ).view(1, 1, q_len)
+        if q_len == 1:
+            q_rel.zero_()
+
+        bank_outputs: list[torch.Tensor] = []
+        bank_evidence: list[torch.Tensor] = []
+        score_scale = float(self.head_dim) ** -0.5
+        neg_large = -1.0e4
+
+        for start in starts:
+            end = min(source_len, int(start) + int(window_size))
+            ctx = context[:, start:end]
+            k, v = self._project_key_value(ctx)
+            local_ids = _build_position_ids(ctx.shape[0], ctx.shape[1], ctx.device)
+            k = _apply_rope(k, *rope(ctx, local_ids))
+
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * score_scale
+            local_mask: torch.Tensor | None = None
+            if attn_mask is not None:
+                local_mask = attn_mask[..., start:end].to(device=scores.device, dtype=torch.bool)
+                masked_scores = scores.masked_fill(~local_mask, float('-inf'))
+                valid_count = local_mask.sum(dim=-1).clamp_min(1)
+            else:
+                masked_scores = scores
+                valid_count = torch.full(
+                    (*scores.shape[:-1],),
+                    max(1, end - start),
+                    device=scores.device,
+                    dtype=torch.long,
+                )
+
+            # Within-bank competition is the same softmax shape the adapter was
+            # trained on. Explicit mask renormalisation avoids NaNs for padded
+            # banks in mixed-length batches.
+            local_prob = torch.softmax(masked_scores, dim=-1)
+            if local_mask is not None:
+                local_prob = torch.where(local_mask, local_prob, torch.zeros_like(local_prob))
+                denom = local_prob.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                local_prob = local_prob / denom
+            bank_y = torch.matmul(local_prob.to(dtype=v.dtype), v)
+
+            # log-mean-exp removes the artificial preference for a bank merely
+            # because it contains more tokens. This is the routing signal only;
+            # token attention above remains ordinary softmax.
+            evidence = torch.logsumexp(masked_scores, dim=-1) - torch.log(
+                valid_count.to(dtype=masked_scores.dtype)
+            )
+            if local_mask is not None:
+                valid_bank = local_mask.any(dim=-1)
+                evidence = torch.where(valid_bank, evidence, torch.full_like(evidence, neg_large))
+
+            if locality_strength != 0.0 and source_len > 1:
+                center = (float(start) + float(max(start, end - 1))) * 0.5 / float(source_len - 1)
+                locality = torch.abs(q_rel - float(center))
+                evidence = evidence - locality * float(locality_strength)
+
+            bank_outputs.append(bank_y)
+            bank_evidence.append(evidence)
+
+        stacked_y = torch.stack(bank_outputs, dim=0)
+        logits = torch.stack(bank_evidence, dim=0)
+        temperature = max(1e-4, float(router_temperature))
+        logits = logits / temperature
+
+        top_k = int(router_top_k)
+        if 0 < top_k < int(logits.shape[0]):
+            _top_values, top_indices = torch.topk(logits, k=top_k, dim=0)
+            keep = torch.zeros_like(logits, dtype=torch.bool)
+            keep.scatter_(0, top_indices, True)
+            logits = logits.masked_fill(~keep, float('-inf'))
+
+        gates = torch.softmax(logits, dim=0)
+        gates = torch.nan_to_num(gates, nan=0.0, posinf=0.0, neginf=0.0)
+        gate_sum = gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
+        gates = gates / gate_sum
+        return (stacked_y * gates.unsqueeze(-1).to(dtype=stacked_y.dtype)).sum(dim=0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        context: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        pos_q: tuple[torch.Tensor, torch.Tensor] | None = None,
+        pos_k: tuple[torch.Tensor, torch.Tensor] | None = None,
+        long_context_options: dict[str, Any] | None = None,
+        rope: _RotaryEmbedding | None = None,
+    ) -> torch.Tensor:
+        context = x if context is None else context
+
+        q = self.q_norm(self._project_query(x))
+        if pos_q is not None:
             q = _apply_rope(q, *pos_q)
-            k = _apply_rope(k, *pos_k)
 
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        options = long_context_options or {}
+        use_windowed = (
+            bool(options.get('enabled', False))
+            and rope is not None
+            and int(context.shape[1]) > int(options.get('threshold', 512))
+        )
+        if use_windowed:
+            y = self._windowed_source_attention(
+                q,
+                context=context,
+                attn_mask=attn_mask,
+                rope=rope,
+                window_size=int(options.get('window_size', 384)),
+                overlap=int(options.get('overlap', 64)),
+                router_top_k=int(options.get('router_top_k', 2)),
+                router_temperature=float(options.get('router_temperature', 0.8)),
+                locality_strength=float(options.get('locality_strength', 1.0)),
+            )
+        else:
+            k, v = self._project_key_value(context)
+            if pos_k is not None:
+                k = _apply_rope(k, *pos_k)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
         y = y.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1).contiguous()
         return self.o_proj(y)
 
@@ -251,7 +419,9 @@ class _AdapterBlock(nn.Module):
         target_mask: torch.Tensor | None,
         source_mask: torch.Tensor | None,
         pos_target: tuple[torch.Tensor, torch.Tensor],
-        pos_source: tuple[torch.Tensor, torch.Tensor],
+        pos_source: tuple[torch.Tensor, torch.Tensor] | None,
+        long_context_options: dict[str, Any] | None = None,
+        rope: _RotaryEmbedding | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(
             self.norm_self_attn(x),
@@ -265,6 +435,8 @@ class _AdapterBlock(nn.Module):
             attn_mask=source_mask,
             pos_q=pos_target,
             pos_k=pos_source,
+            long_context_options=long_context_options,
+            rope=rope,
         )
         x = x + self.mlp(self.norm_mlp(x))
         return x
@@ -285,8 +457,18 @@ class _LLMAdapter(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.norm = _AnimaRMSNorm(dim)
         self.rope = _RotaryEmbedding(dim // heads)
-        # Runtime-only compatibility policy. No weights depend on this flag.
+        # Runtime-only compatibility policies. No weights depend on these flags.
+        # `source_position_mode` is retained for <=512/legacy A-B paths.
         self.source_position_mode = "compress"
+        # v5: sources beyond the native training window are paged into local
+        # memory banks rather than exposed to one >512-key softmax.
+        self.long_context_mode = "windowed"
+        self.long_context_threshold = 512
+        self.long_context_window_size = 384
+        self.long_context_overlap = 64
+        self.long_context_router_top_k = 2
+        self.long_context_router_temperature = 0.8
+        self.long_context_locality_strength = 1.0
 
     def forward(
         self,
@@ -306,22 +488,41 @@ class _LLMAdapter(nn.Module):
             length=target_hidden_states.shape[1],
             device=target_hidden_states.device,
         )
-        if self.source_position_mode == "raw":
-            source_position_ids = _build_position_ids(
-                batch_size=source_context.shape[0],
-                length=source_context.shape[1],
-                device=source_context.device,
-            )
+        use_windowed_long_context = (
+            self.long_context_mode == "windowed"
+            and int(source_context.shape[1]) > int(self.long_context_threshold)
+        )
+        source_position_embed: tuple[torch.Tensor, torch.Tensor] | None
+        if use_windowed_long_context:
+            # Every source bank receives native local 0..window-1 RoPE inside
+            # `_AdapterAttention`; do not pre-compress the complete sequence.
+            source_position_embed = None
         else:
-            source_position_ids = _build_source_position_ids(
-                batch_size=source_context.shape[0],
-                length=source_context.shape[1],
-                device=source_context.device,
-                trained_length=512,
-            )
+            if self.source_position_mode == "raw":
+                source_position_ids = _build_position_ids(
+                    batch_size=source_context.shape[0],
+                    length=source_context.shape[1],
+                    device=source_context.device,
+                )
+            else:
+                source_position_ids = _build_source_position_ids(
+                    batch_size=source_context.shape[0],
+                    length=source_context.shape[1],
+                    device=source_context.device,
+                    trained_length=512,
+                )
+            source_position_embed = self.rope(source_context, source_position_ids)
 
         target_position_embed = self.rope(target_hidden_states, target_position_ids)
-        source_position_embed = self.rope(source_context, source_position_ids)
+        long_context_options = {
+            "enabled": use_windowed_long_context,
+            "threshold": int(self.long_context_threshold),
+            "window_size": int(self.long_context_window_size),
+            "overlap": int(self.long_context_overlap),
+            "router_top_k": int(self.long_context_router_top_k),
+            "router_temperature": float(self.long_context_router_temperature),
+            "locality_strength": float(self.long_context_locality_strength),
+        }
 
         hidden_states = target_hidden_states
         for block in self.blocks:
@@ -332,6 +533,8 @@ class _LLMAdapter(nn.Module):
                 source_mask=normalized_source_mask,
                 pos_target=target_position_embed,
                 pos_source=source_position_embed,
+                long_context_options=long_context_options,
+                rope=self.rope,
             )
         return self.norm(self.out_proj(hidden_states))
 

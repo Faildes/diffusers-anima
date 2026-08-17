@@ -63,6 +63,11 @@ class AnimaTextEncoderConditioner:
     semantic_expansion_group_aware: bool = True
     semantic_expansion_coherence_power: float = 1.0
     semantic_expansion_min_coherence: float = 0.15
+    # v5: a short prompt should not cross the adapter's native 512-source
+    # boundary merely because semantic slots were appended. Long prompts are
+    # handled by the transformer-side windowed router instead.
+    semantic_expansion_preserve_native_window: bool = True
+    semantic_expansion_native_window: int = 512
     metadata: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -74,6 +79,8 @@ class AnimaTextEncoderConditioner:
         self.semantic_expansion_group_aware = bool(self.semantic_expansion_group_aware)
         self.semantic_expansion_coherence_power = max(0.0, float(self.semantic_expansion_coherence_power))
         self.semantic_expansion_min_coherence = max(0.0, min(1.0, float(self.semantic_expansion_min_coherence)))
+        self.semantic_expansion_preserve_native_window = bool(self.semantic_expansion_preserve_native_window)
+        self.semantic_expansion_native_window = max(1, int(self.semantic_expansion_native_window))
 
     @classmethod
     def from_file(
@@ -95,6 +102,8 @@ class AnimaTextEncoderConditioner:
         semantic_expansion_group_aware: bool | None = None,
         semantic_expansion_coherence_power: float | None = None,
         semantic_expansion_min_coherence: float | None = None,
+        semantic_expansion_preserve_native_window: bool | None = None,
+        semantic_expansion_native_window: int | None = None,
     ) -> "AnimaTextEncoderConditioner":
         path = Path(path)
         md = read_text_encoder_profile_metadata(path)
@@ -188,6 +197,14 @@ class AnimaTextEncoderConditioner:
                 md_float("semantic_expansion_min_coherence", 0.15)
                 if semantic_expansion_min_coherence is None else float(semantic_expansion_min_coherence)
             ),
+            semantic_expansion_preserve_native_window=(
+                md_bool("semantic_expansion_preserve_native_window", True)
+                if semantic_expansion_preserve_native_window is None else bool(semantic_expansion_preserve_native_window)
+            ),
+            semantic_expansion_native_window=(
+                _metadata_int(md, "semantic_expansion_native_window", 512)
+                if semantic_expansion_native_window is None else int(semantic_expansion_native_window)
+            ),
             metadata=md,
         )
 
@@ -206,6 +223,8 @@ class AnimaTextEncoderConditioner:
         semantic_expansion_group_aware: bool | None = None,
         semantic_expansion_coherence_power: float | None = None,
         semantic_expansion_min_coherence: float | None = None,
+        semantic_expansion_preserve_native_window: bool | None = None,
+        semantic_expansion_native_window: int | None = None,
     ) -> "AnimaTextEncoderConditioner":
         self.alignment.set_runtime_stability(
             center_strength=center_strength,
@@ -226,6 +245,10 @@ class AnimaTextEncoderConditioner:
             self.semantic_expansion_coherence_power = max(0.0, float(semantic_expansion_coherence_power))
         if semantic_expansion_min_coherence is not None:
             self.semantic_expansion_min_coherence = max(0.0, min(1.0, float(semantic_expansion_min_coherence)))
+        if semantic_expansion_preserve_native_window is not None:
+            self.semantic_expansion_preserve_native_window = bool(semantic_expansion_preserve_native_window)
+        if semantic_expansion_native_window is not None:
+            self.semantic_expansion_native_window = max(1, int(semantic_expansion_native_window))
         return self
 
     def validate_encoder(self, encoder: Any, *, strict_fingerprint: bool = True) -> None:
@@ -294,6 +317,11 @@ class AnimaTextEncoderConditioner:
         source_view = self.alignment.apply_source_preserving(hidden_states)
 
         bsz, seq_len, dim = primary.shape
+        slot_budget = int(self.semantic_expansion_max_tokens)
+        if self.semantic_expansion_preserve_native_window and seq_len < int(self.semantic_expansion_native_window):
+            slot_budget = min(slot_budget, int(self.semantic_expansion_native_window) - int(seq_len))
+        if slot_budget <= 0:
+            return primary, attention_mask
         if attention_mask is None:
             mask = torch.ones((bsz, seq_len), dtype=torch.long, device=primary.device)
         else:
@@ -315,11 +343,11 @@ class AnimaTextEncoderConditioner:
                 sample_groups = groups[b] if (groups is not None and self.semantic_expansion_group_aware) else None
                 segments = self._contiguous_segments(valid, sample_groups)
                 for segment in segments:
-                    if len(slots) >= self.semantic_expansion_max_tokens:
+                    if len(slots) >= slot_budget:
                         break
                     seg_n = int(segment.numel())
                     requested = max(1, math.ceil(seg_n / self.semantic_expansion_chunk_size))
-                    requested = min(requested, self.semantic_expansion_max_tokens - len(slots), seg_n)
+                    requested = min(requested, slot_budget - len(slots), seg_n)
                     for slot_idx in range(requested):
                         lo = (slot_idx * seg_n) // requested
                         hi = ((slot_idx + 1) * seg_n) // requested
@@ -368,6 +396,8 @@ class AnimaTextEncoderConditioner:
             "semantic_expansion_group_aware": self.semantic_expansion_group_aware,
             "semantic_expansion_coherence_power": self.semantic_expansion_coherence_power,
             "semantic_expansion_min_coherence": self.semantic_expansion_min_coherence,
+            "semantic_expansion_preserve_native_window": self.semantic_expansion_preserve_native_window,
+            "semantic_expansion_native_window": self.semantic_expansion_native_window,
             "delta_clip_ratio": self.alignment.delta_clip_ratio,
             "token_rms_strength": self.alignment.token_rms_strength,
             "token_rms_min_ratio": self.alignment.token_rms_min_ratio,

@@ -850,6 +850,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             result["bridge"] = self.text_encoder_bridge.describe()
         if self.text_encoder_conditioner is not None:
             result["conditioner"] = self.text_encoder_conditioner.describe()
+        try:
+            result["adapter_long_context"] = self.describe_adapter_long_context()
+        except Exception:
+            pass
         return result
 
     def set_text_encoder_bridge(
@@ -998,17 +1002,85 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         return self
 
     def set_adapter_source_position_mode(self, mode: str) -> "AnimaPipeline":
-        """Control adapter-side RoPE positions for Qwen source memories longer than 512.
+        """Control the legacy single-bank adapter-side RoPE policy.
 
-        ``"compress"`` keeps every source KV token but maps its adapter RoPE
-        coordinate into the original 0..511 range. ``"raw"`` uses monotonically
-        increasing positions beyond 511 for research / A-B comparison.
+        This setting is used directly for native-length sources and when v5
+        long-context paging is disabled. ``"compress"`` maps a long legacy
+        source into 0..511; ``"raw"`` exposes positions beyond the trained
+        range. For normal long prompts, keep v5 ``long_context_mode="windowed"``.
         """
         normalized = str(mode).strip().lower()
         if normalized not in {"compress", "raw"}:
             raise ValueError("mode must be 'compress' or 'raw'")
         self.transformer.llm_adapter.source_position_mode = normalized
         return self
+
+    def set_adapter_long_context(
+        self,
+        mode: str = "windowed",
+        *,
+        threshold: int | None = None,
+        window_size: int | None = None,
+        overlap: int | None = None,
+        router_top_k: int | None = None,
+        router_temperature: float | None = None,
+        locality_strength: float | None = None,
+    ) -> "AnimaPipeline":
+        """Configure v5 body-side long-source attention.
+
+        ``windowed`` keeps the frozen Anima adapter inside its native <=512
+        source-attention regime and routes each target query across overlapping
+        source banks. ``legacy`` restores the previous one-bank behaviour.
+
+        This removes Anima's *input-source* 512-token cliff without changing the
+        trained 512-slot target-conditioning contract seen by the DiT.
+        """
+        normalized = str(mode).strip().lower()
+        if normalized not in {"windowed", "legacy"}:
+            raise ValueError("mode must be 'windowed' or 'legacy'")
+        adapter = self.transformer.llm_adapter
+        adapter.long_context_mode = normalized
+        if threshold is not None:
+            if int(threshold) < 64:
+                raise ValueError("threshold must be >= 64")
+            adapter.long_context_threshold = int(threshold)
+        if window_size is not None:
+            if not 64 <= int(window_size) <= 512:
+                raise ValueError("window_size must be in [64, 512]")
+            adapter.long_context_window_size = int(window_size)
+        if overlap is not None:
+            if int(overlap) < 0:
+                raise ValueError("overlap must be >= 0")
+            adapter.long_context_overlap = int(overlap)
+        if int(adapter.long_context_overlap) >= int(adapter.long_context_window_size):
+            raise ValueError("overlap must be smaller than window_size")
+        if router_top_k is not None:
+            if int(router_top_k) < 0:
+                raise ValueError("router_top_k must be >= 0 (0 means all banks)")
+            adapter.long_context_router_top_k = int(router_top_k)
+        if router_temperature is not None:
+            if float(router_temperature) <= 0.0:
+                raise ValueError("router_temperature must be > 0")
+            adapter.long_context_router_temperature = float(router_temperature)
+        if locality_strength is not None:
+            if float(locality_strength) < 0.0:
+                raise ValueError("locality_strength must be >= 0")
+            adapter.long_context_locality_strength = float(locality_strength)
+        return self
+
+    def describe_adapter_long_context(self) -> dict[str, Any]:
+        adapter = self.transformer.llm_adapter
+        return {
+            "mode": str(adapter.long_context_mode),
+            "threshold": int(adapter.long_context_threshold),
+            "window_size": int(adapter.long_context_window_size),
+            "overlap": int(adapter.long_context_overlap),
+            "router_top_k": int(adapter.long_context_router_top_k),
+            "router_temperature": float(adapter.long_context_router_temperature),
+            "locality_strength": float(adapter.long_context_locality_strength),
+            "legacy_source_position_mode": str(adapter.source_position_mode),
+            "target_conditioning_length": 512,
+        }
 
     @property
     def execution_device(self) -> str:
