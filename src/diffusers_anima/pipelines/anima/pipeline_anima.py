@@ -72,6 +72,7 @@ from .text_encoding import (
     prepare_condition_inputs_from_plans,
 )
 from .text_encoder_bridge import AnimaTextEncoderBridge
+from .text_encoder_conditioner import AnimaTextEncoderConditioner
 from .validation import (
     ImageBatchInput,
     PromptInput,
@@ -187,7 +188,12 @@ def _prepare_prompt_embedding_inputs(
                 "from_multiple_files to ensure the tokenizer is initialised automatically."
             )
         family = _active_text_encoder_family(pipe.text_encoder)
-        if family == "qwen3.5" and pipe.text_encoder_bridge is None and not getattr(pipe, "_anima_warned_missing_bridge", False):
+        if (
+            family == "qwen3.5"
+            and pipe.text_encoder_bridge is None
+            and pipe.text_encoder_conditioner is None
+            and not getattr(pipe, "_anima_warned_missing_bridge", False)
+        ):
             warnings.warn(
                 "Qwen3.5 is shape-compatible with Anima but its hidden representation is not the "
                 "Qwen3-0.6B space used to train the LLM adapter. Calibrate/load an "
@@ -202,6 +208,7 @@ def _prepare_prompt_embedding_inputs(
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
             bridge=pipe.text_encoder_bridge,
+            conditioner=pipe.text_encoder_conditioner,
         )
         if negative_prompt is None:
             return (
@@ -215,6 +222,7 @@ def _prepare_prompt_embedding_inputs(
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
             bridge=pipe.text_encoder_bridge,
+            conditioner=pipe.text_encoder_conditioner,
         )
 
     return (
@@ -277,6 +285,7 @@ def _encode_prompt_plan_batch(
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
             bridge=pipe.text_encoder_bridge,
+            conditioner=pipe.text_encoder_conditioner,
         )
     with _module_execution_context(
         pipe.transformer,
@@ -711,6 +720,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         # Runtime-only representation bridge. It is intentionally not registered
         # as a Diffusers module or persisted with the pipeline.
         self.text_encoder_bridge: AnimaTextEncoderBridge | None = None
+        # v3 final encoder head. This is mutually exclusive with the legacy
+        # external bridge at normal runtime, but both APIs remain available for A/B.
+        self.text_encoder_conditioner: AnimaTextEncoderConditioner | None = None
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
 
@@ -721,6 +733,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         center_strength: float | None = None,
         variance_strength: float | None = None,
         rms_strength: float | None = None,
+        delta_clip_ratio: float | None = None,
+        token_rms_strength: float | None = None,
+        token_rms_min_ratio: float | None = None,
+        token_rms_max_ratio: float | None = None,
         strict_fingerprint: bool = True,
     ) -> "AnimaPipeline":
         """Load an encoder-compatibility profile for the active Qwen encoder.
@@ -734,6 +750,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             center_strength=center_strength,
             variance_strength=variance_strength,
             rms_strength=rms_strength,
+            delta_clip_ratio=delta_clip_ratio,
+            token_rms_strength=token_rms_strength,
+            token_rms_min_ratio=token_rms_min_ratio,
+            token_rms_max_ratio=token_rms_max_ratio,
         )
         active_family = _active_text_encoder_family(self.text_encoder)
         bridge_source = str(bridge.metadata.get("source_family", "unknown"))
@@ -744,6 +764,66 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             )
         bridge.validate_encoder(self.text_encoder, strict_fingerprint=bool(strict_fingerprint))
         self.text_encoder_bridge = bridge
+        self.text_encoder_conditioner = None
+        setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        return self
+
+    def load_text_encoder_conditioner(
+        self,
+        path: str | Path,
+        *,
+        center_strength: float | None = None,
+        variance_strength: float | None = None,
+        rms_strength: float | None = None,
+        delta_clip_ratio: float | None = None,
+        token_rms_strength: float | None = None,
+        token_rms_min_ratio: float | None = None,
+        token_rms_max_ratio: float | None = None,
+        semantic_expansion_strength: float | None = None,
+        semantic_expansion_max_tokens: int | None = None,
+        semantic_expansion_chunk_size: int | None = None,
+        semantic_expansion_min_source_tokens: int | None = None,
+        semantic_expansion_residual_clip: float | None = None,
+        semantic_expansion_group_aware: bool | None = None,
+        semantic_expansion_coherence_power: float | None = None,
+        semantic_expansion_min_coherence: float | None = None,
+        strict_fingerprint: bool = True,
+    ) -> "AnimaPipeline":
+        """Load the embedded head of a v3 final Anima text encoder.
+
+        The source backbone is retained unchanged. The primary memory is aligned
+        to Anima, and optional semantic slots add a conservative source-preserving
+        view rather than replacing the aligned token stream.
+        """
+        conditioner = AnimaTextEncoderConditioner.from_file(
+            path,
+            center_strength=center_strength,
+            variance_strength=variance_strength,
+            rms_strength=rms_strength,
+            delta_clip_ratio=delta_clip_ratio,
+            token_rms_strength=token_rms_strength,
+            token_rms_min_ratio=token_rms_min_ratio,
+            token_rms_max_ratio=token_rms_max_ratio,
+            semantic_expansion_strength=semantic_expansion_strength,
+            semantic_expansion_max_tokens=semantic_expansion_max_tokens,
+            semantic_expansion_chunk_size=semantic_expansion_chunk_size,
+            semantic_expansion_min_source_tokens=semantic_expansion_min_source_tokens,
+            semantic_expansion_residual_clip=semantic_expansion_residual_clip,
+            semantic_expansion_group_aware=semantic_expansion_group_aware,
+            semantic_expansion_coherence_power=semantic_expansion_coherence_power,
+            semantic_expansion_min_coherence=semantic_expansion_min_coherence,
+        )
+        active_family = _active_text_encoder_family(self.text_encoder)
+        source_family = str(conditioner.metadata.get("source_family", "unknown"))
+        if source_family not in {"", "unknown", active_family}:
+            raise ValueError(
+                "Final text-encoder source family does not match active encoder: "
+                f"artifact={source_family!r}, active={active_family!r}."
+            )
+        conditioner.validate_encoder(self.text_encoder, strict_fingerprint=bool(strict_fingerprint))
+        self.text_encoder_conditioner = conditioner
+        self.text_encoder_bridge = None
+        setattr(self.text_encoder, "_anima_conditioning_ready", True)
         return self
 
     def describe_text_encoder_profile(self) -> dict[str, Any]:
@@ -754,6 +834,13 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             "encoder_family": family,
             "encoder_hidden_size": int(getattr(config, "hidden_size", 0) or 0),
             "bridge_attached": self.text_encoder_bridge is not None,
+            "conditioner_attached": self.text_encoder_conditioner is not None,
+            "anima_ready": (
+                family == "qwen3"
+                or self.text_encoder_bridge is not None
+                or self.text_encoder_conditioner is not None
+                or bool(getattr(self.text_encoder, "_anima_conditioning_ready", False))
+            ),
         }
         profile_metadata = getattr(self.text_encoder, "_anima_text_encoder_profile_metadata", None)
         if isinstance(profile_metadata, dict):
@@ -761,18 +848,127 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             result["encoder_profile_format"] = profile_metadata.get("format", "unknown")
         if self.text_encoder_bridge is not None:
             result["bridge"] = self.text_encoder_bridge.describe()
+        if self.text_encoder_conditioner is not None:
+            result["conditioner"] = self.text_encoder_conditioner.describe()
         return result
 
     def set_text_encoder_bridge(
         self, bridge: AnimaTextEncoderBridge | None
     ) -> "AnimaPipeline":
         self.text_encoder_bridge = bridge
+        if bridge is not None:
+            self.text_encoder_conditioner = None
+            setattr(self.text_encoder, "_anima_conditioning_ready", False)
         return self
 
     def clear_text_encoder_bridge(self) -> "AnimaPipeline":
         if self.text_encoder_bridge is not None:
             self.text_encoder_bridge.clear_runtime_cache()
         self.text_encoder_bridge = None
+        setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        return self
+
+    def set_text_encoder_conditioner(
+        self, conditioner: AnimaTextEncoderConditioner | None
+    ) -> "AnimaPipeline":
+        self.text_encoder_conditioner = conditioner
+        if conditioner is not None:
+            self.text_encoder_bridge = None
+            setattr(self.text_encoder, "_anima_conditioning_ready", True)
+        else:
+            setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        return self
+
+    def clear_text_encoder_conditioner(self) -> "AnimaPipeline":
+        if self.text_encoder_conditioner is not None:
+            self.text_encoder_conditioner.clear_runtime_cache()
+        self.text_encoder_conditioner = None
+        setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        return self
+
+    def set_text_encoder_conditioning_stability(
+        self,
+        *,
+        center_strength: float | None = None,
+        variance_strength: float | None = None,
+        rms_strength: float | None = None,
+        delta_clip_ratio: float | None = None,
+        token_rms_strength: float | None = None,
+        token_rms_min_ratio: float | None = None,
+        token_rms_max_ratio: float | None = None,
+        semantic_expansion_strength: float | None = None,
+        semantic_expansion_residual_clip: float | None = None,
+        semantic_expansion_group_aware: bool | None = None,
+        semantic_expansion_coherence_power: float | None = None,
+        semantic_expansion_min_coherence: float | None = None,
+    ) -> "AnimaPipeline":
+        """Tune v4 stability guards for either a v2 bridge or v3 final encoder.
+
+        The method is intentionally unified so sd_embed/notebooks do not need
+        to care whether the active Anima-ready path is a legacy bridge or the
+        final-encoder conditioner.
+        """
+        if self.text_encoder_conditioner is not None:
+            self.text_encoder_conditioner.set_runtime_stability(
+                center_strength=center_strength,
+                variance_strength=variance_strength,
+                rms_strength=rms_strength,
+                delta_clip_ratio=delta_clip_ratio,
+                token_rms_strength=token_rms_strength,
+                token_rms_min_ratio=token_rms_min_ratio,
+                token_rms_max_ratio=token_rms_max_ratio,
+                semantic_expansion_strength=semantic_expansion_strength,
+                semantic_expansion_residual_clip=semantic_expansion_residual_clip,
+                semantic_expansion_group_aware=semantic_expansion_group_aware,
+                semantic_expansion_coherence_power=semantic_expansion_coherence_power,
+                semantic_expansion_min_coherence=semantic_expansion_min_coherence,
+            )
+            return self
+        if self.text_encoder_bridge is not None:
+            self.text_encoder_bridge.set_runtime_stability(
+                center_strength=center_strength,
+                variance_strength=variance_strength,
+                rms_strength=rms_strength,
+                delta_clip_ratio=delta_clip_ratio,
+                token_rms_strength=token_rms_strength,
+                token_rms_min_ratio=token_rms_min_ratio,
+                token_rms_max_ratio=token_rms_max_ratio,
+            )
+            return self
+        raise RuntimeError("No Anima text-encoder bridge or final conditioner is active.")
+
+    def set_semantic_expansion(
+        self,
+        *,
+        strength: float | None = None,
+        max_tokens: int | None = None,
+        chunk_size: int | None = None,
+        min_source_tokens: int | None = None,
+        residual_clip: float | None = None,
+        group_aware: bool | None = None,
+        coherence_power: float | None = None,
+        min_coherence: float | None = None,
+    ) -> "AnimaPipeline":
+        """Tune the v3 final encoder's additive semantic-memory path for A/B tests."""
+        conditioner = self.text_encoder_conditioner
+        if conditioner is None:
+            raise RuntimeError("No v3 final text-encoder conditioner is active.")
+        if strength is not None:
+            conditioner.semantic_expansion_strength = max(0.0, float(strength))
+        if max_tokens is not None:
+            conditioner.semantic_expansion_max_tokens = max(0, int(max_tokens))
+        if chunk_size is not None:
+            conditioner.semantic_expansion_chunk_size = max(1, int(chunk_size))
+        if min_source_tokens is not None:
+            conditioner.semantic_expansion_min_source_tokens = max(1, int(min_source_tokens))
+        if residual_clip is not None:
+            conditioner.semantic_expansion_residual_clip = max(0.0, float(residual_clip))
+        if group_aware is not None:
+            conditioner.semantic_expansion_group_aware = bool(group_aware)
+        if coherence_power is not None:
+            conditioner.semantic_expansion_coherence_power = max(0.0, float(coherence_power))
+        if min_coherence is not None:
+            conditioner.semantic_expansion_min_coherence = max(0.0, min(1.0, float(min_coherence)))
         return self
 
     def set_qwen_source_max_length(self, max_length: int | None) -> "AnimaPipeline":

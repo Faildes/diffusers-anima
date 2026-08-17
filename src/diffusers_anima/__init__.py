@@ -6,6 +6,7 @@ from .pipelines.anima import (
     AnimaPromptPlan,
     AnimaPromptSpan,
     AnimaTextEncoderBridge,
+    AnimaTextEncoderConditioner,
 )
 from .schedulers import AnimaFlowMatchEulerDiscreteScheduler, AnimaSamplingConfig
 
@@ -43,4 +44,5 @@ __all__ = [
     "AnimaPromptPlan",
     "AnimaPromptSpan",
     "AnimaTextEncoderBridge",
+    "AnimaTextEncoderConditioner",
 ]

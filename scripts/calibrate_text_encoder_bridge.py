@@ -673,6 +673,15 @@ def calibrate_text_encoder_bridge(
             "recommended_center_strength": f"{center_strength:.8g}",
             "recommended_variance_strength": f"{variance_strength:.8g}",
             "recommended_rms_strength": "0",
+            # v4 final-runtime stability defaults are intentionally separate from
+            # calibration-only pooled cosine optimisation.
+            "recommended_delta_clip_ratio": "0.30",
+            "recommended_token_rms_strength": "0.70",
+            "recommended_token_rms_min_ratio": "0.85",
+            "recommended_token_rms_max_ratio": "1.10",
+            "runtime_recommended_center_strength": "1.0",
+            "runtime_recommended_variance_strength": "0.0",
+            "runtime_recommended_rms_strength": "0.0",
             "validation_cosine_before": f"{cos_before:.8g}",
             "validation_cosine_after": f"{cos_after:.8g}",
             "validation_rmse_after": f"{rmse_after:.8g}",

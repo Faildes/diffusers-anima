@@ -116,6 +116,7 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
 | [`docs/text_encoder_profiles.md`](docs/text_encoder_profiles.md) | Qwen3.5/alternate encoder compatibility profile format |
+| [`docs/final_encoder_v4_stability.md`](docs/final_encoder_v4_stability.md) | v3 final encoder + v4 saturation/binding stability layer |
 
 ## Experimental aligned text-encoder profiles
 
@@ -180,3 +181,13 @@ The v2 profile stores architecture fingerprints, calibration-corpus hash,
 held-out validation metrics, recommended center/variance strengths, and optional
 future `bridge.input_projection` support for wider encoders. Calibration uses no
 gradients or optimizer.
+
+
+## Final Anima text encoder v3
+
+For a performance-first single-file encoder, convert a calibrated v2 profile with
+`scripts/finalize_anima_text_encoder.py`. The resulting `anima_text_encoder_v3`
+artifact keeps the complete source backbone and embeds one global conditioning
+head. Its aligned token memory remains the primary signal; optional bounded
+semantic summary slots preserve more Qwen3.5 source geometry as additional KV
+memory. See [`docs/final_text_encoder.md`](docs/final_text_encoder.md).

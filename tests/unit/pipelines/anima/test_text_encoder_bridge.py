@@ -81,3 +81,21 @@ def test_bridge_accepts_future_input_projection_shape():
     )
     assert bridge.source_hidden_size == 3
     assert bridge.bridge_hidden_size == 2
+
+
+def test_v4_delta_clip_bounds_alignment_displacement():
+    bridge = AnimaTextEncoderBridge(
+        rotation=torch.eye(2),
+        source_mean=torch.zeros(2),
+        target_mean=torch.tensor([100.0, 0.0]),
+        center_strength=1.0,
+        delta_clip_ratio=0.25,
+        token_rms_strength=0.0,
+        metadata={"format": "anima_text_encoder_profile_v2"},
+    )
+    hidden = torch.tensor([[[4.0, 0.0]]])
+    out = bridge.apply(hidden)
+    reference = hidden @ bridge.rotation
+    displacement = torch.linalg.vector_norm(out - reference, dim=-1)
+    reference_norm = torch.linalg.vector_norm(reference, dim=-1)
+    assert torch.all(displacement <= reference_norm * 0.25001)

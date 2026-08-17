@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         PreTrainedTokenizerFast,
     )
     from .text_encoder_bridge import AnimaTextEncoderBridge
+    from .text_encoder_conditioner import AnimaTextEncoderConditioner
 
 import torch
 
@@ -166,6 +167,20 @@ def apply_text_encoder_bridge(
     return bridge.apply(hidden_states)
 
 
+def apply_text_encoder_conditioning(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    conditioner: "AnimaTextEncoderConditioner | None" = None,
+    bridge: "AnimaTextEncoderBridge | None" = None,
+    group_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply the final encoder head when present, otherwise the legacy bridge."""
+    if conditioner is not None:
+        return conditioner.build_memory(hidden_states, attention_mask, group_ids=group_ids)
+    return apply_text_encoder_bridge(bridge, hidden_states), attention_mask
+
+
 def prepare_condition_inputs(
     prompt_tokenizer: AnimaPromptTokenizer,
     text_encoder: "PreTrainedModel",
@@ -174,6 +189,7 @@ def prepare_condition_inputs(
     execution_device: str,
     model_dtype: torch.dtype,
     bridge: "AnimaTextEncoderBridge | None" = None,
+    conditioner: "AnimaTextEncoderConditioner | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tokenize/encode prompts while preserving long Qwen source memory.
 
@@ -267,7 +283,9 @@ def prepare_condition_inputs(
         else:
             qwen_hidden = text_encoder_out.last_hidden_state
         qwen_hidden = qwen_hidden.to(model_dtype)
-        qwen_hidden = apply_text_encoder_bridge(bridge, qwen_hidden)
+        qwen_hidden, qwen_mask = apply_text_encoder_conditioning(
+            qwen_hidden, qwen_mask, conditioner=conditioner, bridge=bridge
+        )
     return qwen_hidden, qwen_mask, t5_ids, t5_mask, t5_weights
 
 
@@ -397,11 +415,37 @@ def _factors_from_spans(
     return factors
 
 
+def _groups_from_spans(offsets: list[tuple[int, int]], spans: tuple[Any, ...]) -> list[int]:
+    """Assign each source token to the PromptPlan group with maximum character overlap."""
+    groups: list[int] = []
+    last_group = 0
+    for start, end in offsets:
+        best_group = last_group
+        best_overlap = 0
+        for span in spans:
+            overlap = max(0, min(end, int(span.end)) - max(start, int(span.start)))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_group = int(getattr(span, "group", 0))
+        if best_overlap > 0:
+            last_group = best_group
+        groups.append(best_group)
+    return groups
+
+
 def _apply_qwen_plan_factors(
     hidden_states: torch.Tensor,
     factors: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
+    # Final v3 encoders may append semantic expansion slots after the original
+    # Qwen tokens. Prompt-plan weights apply to visible text tokens only; the
+    # summary slots deliberately receive neutral factor 1.0.
+    if factors.shape[1] < hidden_states.shape[1]:
+        pad = hidden_states.shape[1] - factors.shape[1]
+        factors = torch.nn.functional.pad(factors, (0, pad), value=1.0)
+    elif factors.shape[1] > hidden_states.shape[1]:
+        factors = factors[:, : hidden_states.shape[1]]
     mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
     factors = factors.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
     factors = torch.where(mask > 0, factors, torch.ones_like(factors))
@@ -418,6 +462,7 @@ def prepare_condition_inputs_from_plans(
     execution_device: str,
     model_dtype: torch.dtype,
     bridge: "AnimaTextEncoderBridge | None" = None,
+    conditioner: "AnimaTextEncoderConditioner | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Encode structured prompt plans in one source-memory / one-adapter pass."""
     from .prompt_plan import coerce_prompt_plans
@@ -437,6 +482,7 @@ def prepare_condition_inputs_from_plans(
 
     q_ids_batch: list[list[int]] = []
     q_factor_batch: list[list[float]] = []
+    q_group_batch: list[list[int]] = []
     t_ids_batch: list[list[int]] = []
     t_factor_batch: list[list[float]] = []
     for plan in normalized:
@@ -459,6 +505,7 @@ def prepare_condition_inputs_from_plans(
         )
         q_ids_batch.append(q_ids)
         q_factor_batch.append(_factors_from_spans(q_offsets, plan.spans, attribute="qwen_factor"))
+        q_group_batch.append(_groups_from_spans(q_offsets, plan.spans))
         t_ids_batch.append(t_ids)
         t_factor_batch.append(_factors_from_spans(t_offsets, plan.spans, attribute="t5_factor"))
 
@@ -468,18 +515,20 @@ def prepare_condition_inputs_from_plans(
     qwen_ids = torch.full((bsz, qmax), int(qwen_pad), dtype=torch.long, device=execution_device)
     qwen_mask = torch.zeros((bsz, qmax), dtype=torch.long, device=execution_device)
     qwen_factors = torch.ones((bsz, qmax), dtype=torch.float32, device=execution_device)
+    qwen_groups = torch.zeros((bsz, qmax), dtype=torch.long, device=execution_device)
     t5_ids = torch.full((bsz, tmax), int(t5_pad), dtype=torch.int32, device=execution_device)
     t5_mask = torch.zeros((bsz, tmax), dtype=torch.long, device=execution_device)
     t5_weights = torch.zeros((bsz, tmax, 1), dtype=torch.float32, device=execution_device)
 
-    for i, (qids, qf, tids, tf) in enumerate(
-        zip(q_ids_batch, q_factor_batch, t_ids_batch, t_factor_batch, strict=True)
+    for i, (qids, qf, qg, tids, tf) in enumerate(
+        zip(q_ids_batch, q_factor_batch, q_group_batch, t_ids_batch, t_factor_batch, strict=True)
     ):
         qlen = len(qids)
         tlen = len(tids)
         qwen_ids[i, :qlen] = torch.tensor(qids, dtype=torch.long, device=execution_device)
         qwen_mask[i, :qlen] = 1
         qwen_factors[i, :qlen] = torch.tensor(qf, dtype=torch.float32, device=execution_device)
+        qwen_groups[i, :qlen] = torch.tensor(qg, dtype=torch.long, device=execution_device)
         t5_ids[i, :tlen] = torch.tensor(tids, dtype=torch.int32, device=execution_device)
         t5_mask[i, :tlen] = 1
         t5_weights[i, :tlen, 0] = torch.tensor(tf, dtype=torch.float32, device=execution_device)
@@ -491,6 +540,8 @@ def prepare_condition_inputs_from_plans(
             out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
         qwen_hidden = out[0] if isinstance(out, tuple) else out.last_hidden_state
         qwen_hidden = qwen_hidden.to(dtype=model_dtype)
-        qwen_hidden = apply_text_encoder_bridge(bridge, qwen_hidden)
+        qwen_hidden, qwen_mask = apply_text_encoder_conditioning(
+            qwen_hidden, qwen_mask, conditioner=conditioner, bridge=bridge, group_ids=qwen_groups
+        )
         qwen_hidden = _apply_qwen_plan_factors(qwen_hidden, qwen_factors, qwen_mask)
     return qwen_hidden, qwen_mask, t5_ids, t5_mask, t5_weights

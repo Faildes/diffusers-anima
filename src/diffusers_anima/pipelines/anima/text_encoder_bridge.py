@@ -79,6 +79,12 @@ class AnimaTextEncoderBridge:
     center_strength: float = 1.0
     variance_strength: float = 0.0
     rms_strength: float = 0.0
+    # v4 stability controls. These are deliberately runtime-only transforms
+    # around the global alignment, so the source encoder weights remain intact.
+    delta_clip_ratio: float = 0.0
+    token_rms_strength: float = 0.0
+    token_rms_min_ratio: float = 0.85
+    token_rms_max_ratio: float = 1.10
     metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[tuple[str, torch.dtype], tuple[torch.Tensor | None, ...]] = field(
         default_factory=dict, init=False, repr=False
@@ -114,6 +120,10 @@ class AnimaTextEncoderBridge:
         self.center_strength = float(self.center_strength)
         self.variance_strength = float(self.variance_strength)
         self.rms_strength = float(self.rms_strength)
+        self.delta_clip_ratio = max(0.0, float(self.delta_clip_ratio))
+        self.token_rms_strength = max(0.0, min(1.0, float(self.token_rms_strength)))
+        self.token_rms_min_ratio = max(1e-3, float(self.token_rms_min_ratio))
+        self.token_rms_max_ratio = max(self.token_rms_min_ratio, float(self.token_rms_max_ratio))
 
     @property
     def bridge_hidden_size(self) -> int:
@@ -147,6 +157,10 @@ class AnimaTextEncoderBridge:
         center_strength: float | None = None,
         variance_strength: float | None = None,
         rms_strength: float | None = None,
+        delta_clip_ratio: float | None = None,
+        token_rms_strength: float | None = None,
+        token_rms_min_ratio: float | None = None,
+        token_rms_max_ratio: float | None = None,
     ) -> "AnimaTextEncoderBridge":
         path = Path(path)
         if not path.is_file():
@@ -193,11 +207,22 @@ class AnimaTextEncoderBridge:
                 return float(fallback)
 
         if center_strength is None:
-            center_strength = metadata_float("recommended_center_strength", 0.5 if format_name != _PROFILE_FORMAT_V2 else 1.0)
+            # v4 separates calibration-space optimum from image-runtime defaults.
+            # Full centering is retained, but per-dimension variance matching is
+            # opt-in because it was observed to amplify colour/style channels.
+            center_strength = metadata_float("runtime_recommended_center_strength", 1.0)
         if variance_strength is None:
-            variance_strength = metadata_float("recommended_variance_strength", 0.0)
+            variance_strength = metadata_float("runtime_recommended_variance_strength", 0.0)
         if rms_strength is None:
-            rms_strength = metadata_float("recommended_rms_strength", 0.0)
+            rms_strength = metadata_float("runtime_recommended_rms_strength", 0.0)
+        if delta_clip_ratio is None:
+            delta_clip_ratio = metadata_float("recommended_delta_clip_ratio", 0.30)
+        if token_rms_strength is None:
+            token_rms_strength = metadata_float("recommended_token_rms_strength", 0.70)
+        if token_rms_min_ratio is None:
+            token_rms_min_ratio = metadata_float("recommended_token_rms_min_ratio", 0.85)
+        if token_rms_max_ratio is None:
+            token_rms_max_ratio = metadata_float("recommended_token_rms_max_ratio", 1.10)
 
         return cls(
             rotation=rotation,  # type: ignore[arg-type]
@@ -262,6 +287,62 @@ class AnimaTextEncoderBridge:
     def clear_runtime_cache(self) -> None:
         self._cache.clear()
 
+    def _apply_delta_clip(self, reference: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Limit only the alignment displacement, not the source representation itself."""
+        if self.delta_clip_ratio <= 0.0:
+            return out
+        delta = out - reference
+        delta_norm = torch.linalg.vector_norm(delta.float(), dim=-1, keepdim=True).clamp_min(1e-6)
+        ref_norm = torch.linalg.vector_norm(reference.float(), dim=-1, keepdim=True).clamp_min(1e-6)
+        allowed = ref_norm * float(self.delta_clip_ratio)
+        scale = torch.clamp(allowed / delta_norm, max=1.0).to(delta.dtype)
+        return reference + delta * scale
+
+    def _apply_token_rms_preservation(self, reference: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Partially preserve per-token source energy after rotation.
+
+        The old bridge can match pooled cosine while still changing the norm of
+        individual tokens enough to over-drive colour/style channels. This
+        correction is local per token and deliberately bounded.
+        """
+        if self.token_rms_strength <= 0.0:
+            return out
+        ref_rms = reference.float().square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+        out_rms = out.float().square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+        ratio = (ref_rms / out_rms).clamp(
+            min=float(self.token_rms_min_ratio), max=float(self.token_rms_max_ratio)
+        )
+        scale = 1.0 + (ratio - 1.0) * float(self.token_rms_strength)
+        return out * scale.to(out.dtype)
+
+    def set_runtime_stability(
+        self,
+        *,
+        center_strength: float | None = None,
+        variance_strength: float | None = None,
+        rms_strength: float | None = None,
+        delta_clip_ratio: float | None = None,
+        token_rms_strength: float | None = None,
+        token_rms_min_ratio: float | None = None,
+        token_rms_max_ratio: float | None = None,
+    ) -> "AnimaTextEncoderBridge":
+        if center_strength is not None:
+            self.center_strength = float(center_strength)
+        if variance_strength is not None:
+            self.variance_strength = float(variance_strength)
+        if rms_strength is not None:
+            self.rms_strength = float(rms_strength)
+        if delta_clip_ratio is not None:
+            self.delta_clip_ratio = max(0.0, float(delta_clip_ratio))
+        if token_rms_strength is not None:
+            self.token_rms_strength = max(0.0, min(1.0, float(token_rms_strength)))
+        if token_rms_min_ratio is not None:
+            self.token_rms_min_ratio = max(1e-3, float(token_rms_min_ratio))
+        if token_rms_max_ratio is not None:
+            self.token_rms_max_ratio = max(self.token_rms_min_ratio, float(token_rms_max_ratio))
+        self.clear_runtime_cache()
+        return self
+
     def apply(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3:
             raise ValueError("AnimaTextEncoderBridge expects (batch, sequence, hidden) hidden states.")
@@ -277,12 +358,11 @@ class AnimaTextEncoderBridge:
         if projection is not None:
             x = torch.matmul(x, projection)
 
+        # Orthogonal rotation is the least destructive common coordinate change
+        # and therefore acts as the stability reference for all v4 guards.
+        rotated_uncentered = torch.matmul(x, rotation)
         format_name = self.metadata.get("format", _BRIDGE_FORMAT_V1)
         if format_name == _PROFILE_FORMAT_V2:
-            # v2 has interpretable endpoints:
-            #   center_strength=0 -> pure rotation x @ R
-            #   center_strength=1 -> full centered Procrustes (x-mu_s)@R + mu_t
-            rotated_uncentered = torch.matmul(x, rotation)
             aligned_centered = torch.matmul(x - source_mean, rotation)
             if variance_scale is not None and self.variance_strength != 0.0:
                 scale = 1.0 + (variance_scale - 1.0) * self.variance_strength
@@ -290,7 +370,6 @@ class AnimaTextEncoderBridge:
             fully_centered = aligned_centered + target_mean
             out = rotated_uncentered + (fully_centered - rotated_uncentered) * self.center_strength
         else:
-            # Preserve v1 interpretation for old bridge files.
             aligned_centered = torch.matmul(x - source_mean, rotation)
             if variance_scale is not None and self.variance_strength != 0.0:
                 scale = 1.0 + (variance_scale - 1.0) * self.variance_strength
@@ -298,9 +377,40 @@ class AnimaTextEncoderBridge:
             center = source_mean + (target_mean - source_mean) * self.center_strength
             out = aligned_centered + center
 
+        # Keep pooled-space alignment but stop individual tokens from being
+        # displaced far enough to collapse identity/binding or over-drive style.
+        out = self._apply_delta_clip(rotated_uncentered, out)
+
         if rms_scale is not None and self.rms_strength != 0.0:
             scale = 1.0 + (rms_scale - 1.0) * self.rms_strength
             out = out * scale
+        out = self._apply_token_rms_preservation(rotated_uncentered, out)
+        return out.to(dtype=output_dtype)
+
+    def apply_source_preserving(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Map source features into Anima coordinates without covariance matching.
+
+        This view uses the same global projection/rotation and target centering as
+        the compatibility bridge, but deliberately skips variance/RMS correction.
+        For the common 1024->1024 case the transform is an orthogonal rotation
+        plus translation, so relative source geometry is preserved.  Final Anima
+        encoders use this only for optional semantic-expansion memory; the primary
+        token stream remains fully reference-aligned.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError("AnimaTextEncoderBridge expects (batch, sequence, hidden) hidden states.")
+        if int(hidden_states.shape[-1]) != self.source_hidden_size:
+            raise ValueError(
+                f"Bridge source hidden size is {self.source_hidden_size}, got {int(hidden_states.shape[-1])}."
+            )
+        output_dtype = hidden_states.dtype
+        projection, rotation, source_mean, target_mean, _variance_scale, _rms_scale = self._runtime_tensors(
+            hidden_states.device, hidden_states.dtype
+        )
+        x = hidden_states.float()
+        if projection is not None:
+            x = torch.matmul(x, projection)
+        out = torch.matmul(x - source_mean, rotation) + target_mean
         return out.to(dtype=output_dtype)
 
     def describe(self) -> dict[str, Any]:
@@ -320,6 +430,10 @@ class AnimaTextEncoderBridge:
             "rms_strength": self.rms_strength,
             "has_variance_scale": self.variance_scale is not None,
             "has_input_projection": self.input_projection is not None,
+            "delta_clip_ratio": self.delta_clip_ratio,
+            "token_rms_strength": self.token_rms_strength,
+            "token_rms_min_ratio": self.token_rms_min_ratio,
+            "token_rms_max_ratio": self.token_rms_max_ratio,
             "contains_encoder_weights": self.contains_encoder_weights,
             "validation_cosine_before": self.metadata.get("validation_cosine_before"),
             "validation_cosine_after": self.metadata.get("validation_cosine_after"),

@@ -634,9 +634,14 @@ def load_text_encoder_single_file(
     except Exception:
         metadata = {}
     profile_format = metadata.get("format") == "anima_text_encoder_profile_v2"
+    final_encoder_format = (
+        metadata.get("format") == "anima_text_encoder_v3"
+        and metadata.get("artifact_kind") == "final_encoder"
+    )
+    packaged_encoder = profile_format or final_encoder_format
 
     state_dict = load_file(file_path, device="cpu")
-    if profile_format:
+    if packaged_encoder:
         if metadata.get("contains_encoder_weights", "false").lower() != "true":
             raise ValueError(
                 "This Anima text-encoder profile contains bridge calibration only and cannot be used "
@@ -655,7 +660,7 @@ def load_text_encoder_single_file(
     else:
         family = _detect_text_encoder_family(state_dict)
 
-    source_config_json = metadata.get("source_config_json") if profile_format else None
+    source_config_json = metadata.get("source_config_json") if packaged_encoder else None
     source_config: dict[str, Any] | None = None
     if source_config_json:
         try:
@@ -671,7 +676,7 @@ def load_text_encoder_single_file(
                 "Qwen3.5 text-encoder loading requires a Transformers version "
                 "that provides Qwen3_5TextConfig/Qwen3_5TextModel. Upgrade transformers."
             ) from exc
-        text_state = dict(state_dict) if profile_format else _extract_qwen35_text_state_dict(state_dict)
+        text_state = dict(state_dict) if packaged_encoder else _extract_qwen35_text_state_dict(state_dict)
         del state_dict
         config = Qwen3_5TextConfig(**(source_config or QWEN35_08B_TEXT_CONFIG))
         text_encoder = Qwen3_5TextModel(config)
@@ -694,10 +699,10 @@ def load_text_encoder_single_file(
                 stacklevel=2,
             )
         setattr(text_encoder, "_anima_text_encoder_family", "qwen3.5")
-        tokenizer_source = metadata.get("source_tokenizer", _QWEN35_TOKENIZER_SOURCE) if profile_format else _QWEN35_TOKENIZER_SOURCE
+        tokenizer_source = metadata.get("source_tokenizer", _QWEN35_TOKENIZER_SOURCE) if packaged_encoder else _QWEN35_TOKENIZER_SOURCE
         setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
     else:
-        if not profile_format:
+        if not packaged_encoder:
             state_dict = _strip_model_prefix(state_dict)
         config = Qwen3Config(**(source_config or QWEN3_06B_CONFIG))
         text_encoder = Qwen3Model(config)
@@ -709,7 +714,7 @@ def load_text_encoder_single_file(
             )
         del state_dict
         setattr(text_encoder, "_anima_text_encoder_family", "qwen3")
-        tokenizer_source = metadata.get("source_tokenizer", _QWEN_TOKENIZER_SOURCE) if profile_format else _QWEN_TOKENIZER_SOURCE
+        tokenizer_source = metadata.get("source_tokenizer", _QWEN_TOKENIZER_SOURCE) if packaged_encoder else _QWEN_TOKENIZER_SOURCE
         setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
 
     if profile_format:
@@ -717,6 +722,13 @@ def load_text_encoder_single_file(
         # bridge from the same self-contained aligned-encoder artifact.
         setattr(text_encoder, "_anima_embedded_bridge_path", str(file_path))
         setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
+    elif final_encoder_format:
+        # v3 is a single-file final encoder: the Qwen backbone remains intact,
+        # while the embedded conditioning head is loaded as part of the encoder
+        # runtime rather than exposed as a separate bridge artifact.
+        setattr(text_encoder, "_anima_embedded_conditioner_path", str(file_path))
+        setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
+        setattr(text_encoder, "_anima_final_encoder_artifact", True)
 
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)
@@ -1030,7 +1042,11 @@ def build_anima_pipeline(
         text_encoder_dtype=resolved_text_encoder_dtype,
         use_module_cpu_offload=False,
     )
-    embedded_bridge_path = getattr(text_encoder, "_anima_embedded_bridge_path", None)
-    if embedded_bridge_path:
-        runtime.load_text_encoder_bridge(embedded_bridge_path)
+    embedded_conditioner_path = getattr(text_encoder, "_anima_embedded_conditioner_path", None)
+    if embedded_conditioner_path:
+        runtime.load_text_encoder_conditioner(embedded_conditioner_path)
+    else:
+        embedded_bridge_path = getattr(text_encoder, "_anima_embedded_bridge_path", None)
+        if embedded_bridge_path:
+            runtime.load_text_encoder_bridge(embedded_bridge_path)
     return runtime

@@ -14,7 +14,8 @@ from typing import Any, Iterable
 
 SUBJECTS = [
     "1girl", "1boy", "1woman", "1man", "two women", "two men", "woman and man",
-    "solo", "duo", "trio", "group portrait", "android girl", "humanoid robot",
+    "solo", "duo", "trio", "group portrait", "three women", "two girls and one boy",
+    "crowd of students", "android girl", "humanoid robot",
     "elf woman", "witch", "knight", "pilot", "scientist", "mechanic", "musician",
     "dancer", "office worker", "traveler", "athlete", "chef", "astronaut",
 ]
@@ -62,7 +63,8 @@ COMPOSITION = [
     "diagonal composition", "triangular composition", "circular eye path", "clear focal hierarchy",
     "foreground hand as focal point", "large readable face", "clean silhouette", "layered depth",
     "foreground framing", "leading lines", "negative space", "symmetrical layout", "asymmetrical balance",
-    "overlapping depth without covering faces", "small central gap between subjects", "dynamic crop",
+    "overlapping depth without covering faces", "small central gap between subjects",
+    "clear separation between subjects", "dynamic crop",
 ]
 ENVIRONMENTS = [
     "sunlit forest", "autumn woodland", "rainy city street", "neon alley", "school classroom",
@@ -79,7 +81,8 @@ LIGHTING = [
 ]
 COLORS = [
     "warm palette", "cool palette", "complementary orange and blue", "red and cyan accents",
-    "pastel palette", "muted earth tones", "high saturation", "controlled saturation", "monochrome",
+    "pastel palette", "muted earth tones", "high saturation", "controlled saturation",
+    "low saturation", "neutral palette", "monochrome",
     "black and white with one red accent", "gold and navy palette", "mint and pink palette",
 ]
 STYLES = [
@@ -97,6 +100,9 @@ RELATIONS = [
     "standing behind a chair", "sitting beside a window", "walking toward the camera",
     "reaching past the camera", "one subject in front of the other", "two subjects facing each other",
     "two subjects back to back", "one subject looking at the other", "hands meeting at the center",
+    "left subject wears white and right subject wears black",
+    "foreground subject has short hair and background subject has long hair",
+    "front-left subject points at the viewer while rear-right subject looks away",
     "object between the subject and the viewer", "foreground object partially occluding the lower frame",
 ]
 MATERIALS = [
