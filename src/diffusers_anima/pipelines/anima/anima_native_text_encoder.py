@@ -211,7 +211,12 @@ class AnimaNativeQwen35Head(nn.Module):
         final_hidden = hidden_states[-1]
         stacked = torch.stack(selected, dim=-2)  # [B, N, K, D]
 
-        token_logits = self.layer_gate(final_hidden.float())
+        # Keep the Linear matmul in the head parameter dtype (normally BF16 on
+        # CUDA) and promote only the tiny K-way gate logits to FP32 for the
+        # numerically sensitive softmax.  Casting ``final_hidden`` to FP32 before
+        # a BF16 Linear raises: mat1 and mat2 must have the same dtype.
+        gate_input = final_hidden.to(dtype=self.layer_gate.weight.dtype)
+        token_logits = self.layer_gate(gate_input).float()  # ANIMA_NATIVE_BF16_SAFE_GATE_V1
         token_logits = token_logits + self.layer_logits.float().view(1, 1, -1)
         layer_weights = torch.softmax(token_logits, dim=-1).to(dtype=stacked.dtype)
         mixed = (stacked * layer_weights.unsqueeze(-1)).sum(dim=-2)
