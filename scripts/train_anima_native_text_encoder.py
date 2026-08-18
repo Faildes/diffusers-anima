@@ -19,6 +19,7 @@ the final native checkpoint.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import asdict, dataclass
 import gc
 import hashlib
@@ -155,34 +156,175 @@ def _emit(callback: ProgressCallback | None, **payload: Any) -> None:
     print(f"[anima-native:{stage}] " + " ".join(f"{k}={v}" for k, v in payload.items()))
 
 
-def make_jupyter_progress_callback() -> ProgressCallback:
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(float(seconds)) or float(seconds) < 0:
+        return "--"
+    total = int(round(float(seconds)))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def make_jupyter_progress_callback(*, history_size: int = 8) -> ProgressCallback:
+    """Create a detailed Jupyter progress display with elapsed time and ETA.
+
+    ETA is based on an EMA of completed optimiser-step durations.  Model loading
+    and save stages have unknown totals, so they show elapsed time rather than a
+    fabricated percentage.  The callback also shows GPU memory when available.
+    """
     try:
         from IPython.display import HTML, display
     except Exception:
         return lambda payload: _emit(None, **payload)
+
     handle: dict[str, Any] = {"display": None}
+    created = time.perf_counter()
+    stage_started = created
+    current_stage: str | None = None
+    last_step_time: float | None = None
+    last_step: int | None = None
+    ema_step_seconds: float | None = None
+    history: deque[str] = deque(maxlen=max(1, int(history_size)))
+
+    def _gpu_stats() -> str:
+        if not torch.cuda.is_available():
+            return "GPU: unavailable"
+        dev = torch.cuda.current_device()
+        alloc = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+        peak = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+        name = torch.cuda.get_device_name(dev)
+        return f"GPU {name}: {alloc:.2f} GiB alloc / {reserved:.2f} GiB reserved / {peak:.2f} GiB peak"
 
     def callback(payload: dict[str, Any]) -> None:
+        nonlocal stage_started, current_stage, last_step_time, last_step, ema_step_seconds
+        now = time.perf_counter()
         stage = str(payload.get("stage", "train"))
+        if stage != current_stage:
+            current_stage = stage
+            stage_started = now
+            last_step_time = None
+            last_step = None
+            ema_step_seconds = None
+
         step = payload.get("step")
         total = payload.get("total")
+        step_i = int(step) if isinstance(step, (int, float)) else None
+        total_i = int(total) if isinstance(total, (int, float)) and int(total) > 0 else None
+
+        # Prefer timing supplied by the trainer; otherwise estimate from callback cadence.
+        supplied_step_seconds = payload.get("step_seconds_ema")
+        if supplied_step_seconds is not None:
+            try:
+                ema_step_seconds = float(supplied_step_seconds)
+            except Exception:
+                pass
+        elif step_i is not None and last_step_time is not None and last_step is not None and step_i > last_step:
+            sample = (now - last_step_time) / max(1, step_i - last_step)
+            ema_step_seconds = sample if ema_step_seconds is None else (0.85 * ema_step_seconds + 0.15 * sample)
+        if step_i is not None:
+            last_step = step_i
+            last_step_time = now
+
+        pct: float | None = None
+        eta: float | None = None
+        if step_i is not None and total_i is not None:
+            pct = 100.0 * max(0, min(step_i, total_i)) / total_i
+            supplied_eta = payload.get("eta_seconds")
+            if supplied_eta is not None:
+                try:
+                    eta = max(0.0, float(supplied_eta))
+                except Exception:
+                    eta = None
+            elif ema_step_seconds is not None:
+                eta = max(0, total_i - step_i) * ema_step_seconds
+
+        total_elapsed = now - created
+        stage_elapsed = now - stage_started
         loss = payload.get("loss")
-        pct = 0.0
-        if isinstance(step, int) and isinstance(total, int) and total > 0:
-            pct = 100.0 * step / total
-        line = f"<b>{stage}</b>"
-        if step is not None and total is not None:
-            line += f" &nbsp; {step}/{total} ({pct:.1f}%)"
+        epoch = payload.get("epoch")
+        lr = payload.get("lr")
+        micro = payload.get("micro_step")
+        micro_total = payload.get("micro_total")
+
+        title = f"<b>{stage}</b>"
+        if step_i is not None and total_i is not None:
+            title += f" &nbsp; step {step_i:,}/{total_i:,}"
+            if pct is not None:
+                title += f" &nbsp; <b>{pct:5.1f}%</b>"
+        if epoch is not None:
+            title += f" &nbsp; epoch {epoch}"
+        if micro is not None and micro_total is not None:
+            title += f" &nbsp; micro {micro}/{micro_total}"
+
+        stats = [
+            f"Elapsed: <b>{_format_duration(total_elapsed)}</b>",
+            f"Stage: {_format_duration(stage_elapsed)}",
+            f"ETA: <b>{_format_duration(eta)}</b>",
+        ]
+        if ema_step_seconds is not None and ema_step_seconds > 0:
+            stats.append(f"EMA: {ema_step_seconds:.2f}s/step ({1.0/ema_step_seconds:.3f} step/s)")
         if loss is not None:
-            line += f" &nbsp; loss={float(loss):.6f}"
+            try:
+                stats.append(f"loss={float(loss):.6f}")
+            except Exception:
+                stats.append(f"loss={loss}")
+        if lr is not None:
+            stats.append(f"lr={lr}")
+        if payload.get("gain") is not None:
+            stats.append(f"gain={payload.get('gain')}")
+
+        loss_parts = []
+        for key in ("compat", "source_geom", "token_geom", "knowledge", "distribution", "bootstrap"):
+            if key in payload:
+                try:
+                    loss_parts.append(f"{key}={float(payload[key]):.4f}")
+                except Exception:
+                    loss_parts.append(f"{key}={payload[key]}")
+
         details = " ".join(
             f"{k}={v}" for k, v in payload.items()
-            if k not in {"stage", "step", "total", "loss"}
+            if k not in {
+                "stage", "step", "total", "loss", "epoch", "lr", "gain",
+                "eta_seconds", "elapsed_seconds", "stage_elapsed_seconds",
+                "step_seconds", "step_seconds_ema", "micro_step", "micro_total",
+                "compat", "source_geom", "token_geom", "knowledge", "distribution", "bootstrap",
+            }
         )
+        summary = f"{stage}"
+        if step_i is not None and total_i is not None:
+            summary += f" {step_i}/{total_i}"
+        if loss is not None:
+            summary += f" loss={loss}"
+        history.append(summary)
+
+        if pct is None:
+            bar = (
+                '<div style="height:10px;background:#ddd;border-radius:5px;overflow:hidden;margin-top:7px">'
+                '<div style="height:100%;width:35%;background:#4c8bf5;opacity:.55"></div></div>'
+            )
+        else:
+            bar = (
+                '<div style="height:10px;background:#ddd;border-radius:5px;overflow:hidden;margin-top:7px">'
+                f'<div style="height:100%;width:{pct:.2f}%;background:#4c8bf5"></div></div>'
+            )
+
+        history_html = "<br>".join(history)
         html = HTML(
-            f'<div style="font-family:monospace">{line}<br>{details}'
-            f'<div style="height:8px;background:#ddd;border-radius:4px;overflow:hidden;margin-top:4px">'
-            f'<div style="height:100%;width:{pct:.2f}%;background:#4c8bf5"></div></div></div>'
+            '<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.45;'
+            'border:1px solid #bbb;border-radius:10px;padding:10px 12px">'
+            f'<div style="font-size:15px">{title}</div>{bar}'
+            f'<div style="margin-top:8px">{" &nbsp; | &nbsp; ".join(stats)}</div>'
+            f'<div style="margin-top:5px">{_gpu_stats()}</div>'
+            + (f'<div style="margin-top:5px">{" &nbsp; ".join(loss_parts)}</div>' if loss_parts else "")
+            + (f'<div style="margin-top:5px;color:#666">{details}</div>' if details else "")
+            + f'<details style="margin-top:7px"><summary>Recent updates</summary>'
+              f'<div style="margin-top:5px;color:#666">{history_html}</div></details></div>'
         )
         if handle["display"] is None:
             handle["display"] = display(html, display_id=True)
@@ -451,6 +593,14 @@ def train_anima_native_text_encoder(
     ref_device = device if cfg.reference_device == "auto" else _resolve_device(cfg.reference_device)
     dtype = _resolve_dtype(cfg.dtype, device)
     ref_dtype = _resolve_dtype(cfg.dtype, ref_device)
+    _emit(
+        progress_callback,
+        stage="prepare",
+        message="initialising corpus/tokenizers/models",
+        device=device,
+        reference_device=ref_device,
+        dtype=str(dtype).replace("torch.", ""),
+    )
 
     lines = read_prompt_lines(cfg.prompts)
     groups = build_training_groups(
@@ -461,9 +611,11 @@ def train_anima_native_text_encoder(
     )
     preview = preview_training_groups(groups)
     training_rows = int(preview["rows"])
-    _emit(progress_callback, stage="corpus", **preview)
+    _emit(progress_callback, stage="corpus", prompt_lines=len(lines), **preview)
 
+    _emit(progress_callback, stage="tokenizers", message="loading source tokenizer")
     source_tok = AutoTokenizer.from_pretrained(str(cfg.source_tokenizer))
+    _emit(progress_callback, stage="tokenizers", message="loading reference tokenizer")
     ref_tok = AutoTokenizer.from_pretrained(str(cfg.reference_tokenizer))
     if source_tok.pad_token_id is None:
         source_tok.pad_token = source_tok.eos_token
@@ -471,6 +623,7 @@ def train_anima_native_text_encoder(
         ref_tok.pad_token = ref_tok.eos_token
 
     if cfg.resume_native:
+        _emit(progress_callback, stage="source_load", message="loading native checkpoint", path=str(cfg.resume_native))
         loaded = load_text_encoder_single_file(str(cfg.resume_native), device=device, dtype=dtype, cache=False)
         if not isinstance(loaded, AnimaNativeQwen35Encoder):
             raise ValueError("resume_native must be an anima_native_text_encoder_v1 checkpoint")
@@ -479,6 +632,7 @@ def train_anima_native_text_encoder(
     else:
         if not cfg.source_model:
             raise ValueError("source_model is required when resume_native is not supplied")
+        _emit(progress_callback, stage="source_load", message="loading raw Qwen3.5 source", path=str(cfg.source_model))
         backbone = load_text_encoder_single_file(str(cfg.source_model), device=device, dtype=dtype, cache=False)
         if isinstance(backbone, AnimaNativeQwen35Encoder):
             raise ValueError("source_model should be the raw Qwen3.5 source; use resume_native for native checkpoints")
@@ -502,6 +656,13 @@ def train_anima_native_text_encoder(
         student = AnimaNativeQwen35Encoder(backbone, AnimaNativeQwen35Head(head_cfg)).to(device=device, dtype=dtype)
         fresh_native = True
 
+    _emit(
+        progress_callback,
+        stage="source_ready",
+        message="source/native student loaded",
+        train_last_n_layers=int(cfg.train_last_n_layers),
+    )
+
     bootstrap_bridge: AnimaTextEncoderBridge | None = None
     if cfg.bootstrap_bridge_profile:
         bootstrap_bridge = AnimaTextEncoderBridge.from_file(
@@ -523,9 +684,11 @@ def train_anima_native_text_encoder(
             )
         _emit(progress_callback, stage="bootstrap", bridge=str(cfg.bootstrap_bridge_profile))
 
+    _emit(progress_callback, stage="reference_load", message="loading Qwen3-0.6B Anima reference", path=str(cfg.reference_model))
     reference = load_text_encoder_single_file(
         str(cfg.reference_model), device=ref_device, dtype=ref_dtype, cache=False
     )
+    _emit(progress_callback, stage="reference_ready", message="reference loaded")
     reference.eval().requires_grad_(False)
 
     student.native_head.requires_grad_(True)
@@ -556,6 +719,17 @@ def train_anima_native_text_encoder(
     )
     total_steps = int(cfg.max_steps) if int(cfg.max_steps) > 0 else optimizer_steps_per_epoch * max(1, int(cfg.epochs))
     warmup = max(0, round(total_steps * max(0.0, float(cfg.warmup_fraction))))
+    _emit(
+        progress_callback,
+        stage="optimizer",
+        step=0,
+        total=total_steps,
+        rows=training_rows,
+        micro_steps_per_epoch=micro_steps_per_epoch,
+        optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        gradient_accumulation=int(cfg.gradient_accumulation_steps),
+        warmup_steps=warmup,
+    )
 
     def lr_lambda(step: int) -> float:
         if warmup > 0 and step < warmup:
@@ -571,6 +745,11 @@ def train_anima_native_text_encoder(
     accum = 0
     last_loss = float("nan")
     running: dict[str, float] = {}
+    train_started = time.perf_counter()
+    last_optimizer_time = train_started
+    ema_step_seconds: float | None = None
+    micro_step_global = 0
+    micro_total = max(1, micro_steps_per_epoch * max(1, int(cfg.epochs)))
 
     for epoch in range(max(1, int(cfg.epochs))):
         if global_step >= total_steps:
@@ -578,6 +757,7 @@ def train_anima_native_text_encoder(
         for group_batch in _iter_group_batches(groups, row_batch_size=max(2, int(cfg.batch_size)), rng=rng):
             if global_step >= total_steps:
                 break
+            micro_step_global += 1
             texts, pairs = _flatten_group_batch(group_batch)
             src = _tokenize(source_tok, texts, device=device, max_length=int(cfg.max_length))
             ref = _tokenize(ref_tok, texts, device=ref_device, max_length=int(cfg.max_length))
@@ -708,17 +888,40 @@ def train_anima_native_text_encoder(
                 accum = 0
                 global_step += 1
 
+                step_now = time.perf_counter()
+                step_seconds = max(1e-9, step_now - last_optimizer_time)
+                last_optimizer_time = step_now
+                ema_step_seconds = (
+                    step_seconds
+                    if ema_step_seconds is None
+                    else 0.90 * ema_step_seconds + 0.10 * step_seconds
+                )
                 if global_step == 1 or global_step % max(1, int(cfg.log_every)) == 0 or global_step >= total_steps:
-                    denom = float(max(1, int(cfg.log_every) if global_step > 1 else 1))
+                    interval = max(1, min(int(cfg.log_every), global_step))
+                    avg_values = {key: value / float(interval) for key, value in running.items()}
+                    elapsed_train = step_now - train_started
+                    eta_seconds = max(0, total_steps - global_step) * float(ema_step_seconds)
                     _emit(
                         progress_callback,
                         stage="train",
                         step=global_step,
                         total=total_steps,
+                        micro_step=micro_step_global,
+                        micro_total=micro_total,
                         epoch=epoch + 1,
                         loss=f"{last_loss:.6f}",
                         lr=f"{scheduler.get_last_lr()[0]:.3e}",
                         gain=f"{values['gain']:.4f}",
+                        elapsed_seconds=f"{elapsed_train:.3f}",
+                        eta_seconds=f"{eta_seconds:.3f}",
+                        step_seconds=f"{step_seconds:.3f}",
+                        step_seconds_ema=f"{float(ema_step_seconds):.3f}",
+                        compat=f"{avg_values.get('compat', values['compat']):.6f}",
+                        source_geom=f"{avg_values.get('source_geom', values['source_geom']):.6f}",
+                        token_geom=f"{avg_values.get('token_geom', values['token_geom']):.6f}",
+                        knowledge=f"{avg_values.get('knowledge', values['knowledge']):.6f}",
+                        distribution=f"{avg_values.get('distribution', values['distribution']):.6f}",
+                        bootstrap=f"{avg_values.get('bootstrap', values['bootstrap']):.6f}",
                     )
                     running.clear()
 
@@ -735,8 +938,28 @@ def train_anima_native_text_encoder(
             optimizer.zero_grad(set_to_none=True)
             accum = 0
             global_step += 1
+            step_now = time.perf_counter()
+            step_seconds = max(1e-9, step_now - last_optimizer_time)
+            last_optimizer_time = step_now
+            ema_step_seconds = step_seconds if ema_step_seconds is None else 0.90 * ema_step_seconds + 0.10 * step_seconds
+            _emit(
+                progress_callback,
+                stage="train",
+                step=global_step,
+                total=total_steps,
+                micro_step=micro_step_global,
+                micro_total=micro_total,
+                epoch=epoch + 1,
+                loss=f"{last_loss:.6f}",
+                lr=f"{scheduler.get_last_lr()[0]:.3e}",
+                elapsed_seconds=f"{time.perf_counter() - train_started:.3f}",
+                eta_seconds=f"{max(0, total_steps - global_step) * float(ema_step_seconds):.3f}",
+                step_seconds=f"{step_seconds:.3f}",
+                step_seconds_ema=f"{float(ema_step_seconds):.3f}",
+            )
 
     output = Path(cfg.output)
+    _emit(progress_callback, stage="save", message="serialising native encoder", output=str(output))
     metadata = _save_native_encoder(
         student,
         output,
@@ -756,7 +979,16 @@ def train_anima_native_text_encoder(
         metadata=metadata,
         final_loss=last_loss,
     )
-    _emit(progress_callback, stage="done", step=global_step, total=global_step, loss=f"{last_loss:.6f}", output=output)
+    _emit(
+        progress_callback,
+        stage="done",
+        step=global_step,
+        total=max(global_step, total_steps),
+        loss=f"{last_loss:.6f}",
+        output=output,
+        elapsed_seconds=f"{elapsed:.3f}",
+        eta_seconds="0",
+    )
     del reference, student
     gc.collect()
     if torch.cuda.is_available():
@@ -797,6 +1029,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-fraction", type=float, default=0.35)
     p.add_argument("--binding-pairs", type=int, default=256)
     p.add_argument("--seed", type=int, default=3571)
+    p.add_argument("--log-every", type=int, default=1)
     return p
 
 
@@ -828,6 +1061,7 @@ def main() -> None:
         pair_fraction=a.pair_fraction,
         binding_pairs=a.binding_pairs,
         seed=a.seed,
+        log_every=a.log_every,
     )
     result = train_anima_native_text_encoder(cfg)
     print(result.summary())
