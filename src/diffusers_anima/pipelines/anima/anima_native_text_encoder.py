@@ -45,12 +45,13 @@ def _parse_layer_indices(value: str | Sequence[int] | None, *, num_layers: int) 
     if value is None:
         # hidden_states[0] is the embedding output.  These are therefore roughly
         # 25/50/75/100% depth for the 24-layer Qwen3.5-0.8B backbone.
-        raw: list[int] = [
-            max(1, round(num_layers * 0.25)),
-            max(1, round(num_layers * 0.50)),
-            max(1, round(num_layers * 0.75)),
-            max(1, num_layers),
-        ]
+        # Qwen3.5 uses a 3:1 linear/full-attention stack.  For the 24-layer
+        # 0.8B model the full-attention milestones are 4/8/12/16/20/24.
+        # Sampling six roughly-equal depth milestones preserves lexical/local
+        # features from the middle of the network while still exposing the
+        # strongest final semantic representation.
+        steps = min(6, max(1, int(num_layers)))
+        raw = [max(1, round(num_layers * i / steps)) for i in range(1, steps + 1)]
     elif isinstance(value, str):
         parsed = json.loads(value)
         if not isinstance(parsed, list):
@@ -89,9 +90,12 @@ class _NativeRMSNorm(nn.Module):
 class AnimaNativeHeadConfig:
     hidden_size: int = 1024
     intermediate_size: int = 1536
-    layer_indices: tuple[int, ...] = (6, 12, 18, 24)
+    layer_indices: tuple[int, ...] = (4, 8, 12, 16, 20, 24)
     norm_eps: float = 1e-6
-    final_layer_logit_bias: float = 6.0
+    final_layer_logit_bias: float = 3.0
+    max_subject_slots: int = 16
+    binding_rms_min_ratio: float = 0.92
+    binding_rms_max_ratio: float = 1.08
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, str], *, num_layers: int, hidden_size: int) -> "AnimaNativeHeadConfig":
@@ -114,7 +118,10 @@ class AnimaNativeHeadConfig:
                 metadata.get("native_layer_indices_json"), num_layers=int(num_layers)
             ),
             norm_eps=_float("native_norm_eps", 1e-6),
-            final_layer_logit_bias=_float("native_final_layer_logit_bias", 6.0),
+            final_layer_logit_bias=_float("native_final_layer_logit_bias", 3.0),
+            max_subject_slots=max(2, _int("native_max_subject_slots", 16)),
+            binding_rms_min_ratio=_float("native_binding_rms_min_ratio", 0.92),
+            binding_rms_max_ratio=_float("native_binding_rms_max_ratio", 1.08),
         )
 
 
@@ -156,6 +163,24 @@ class AnimaNativeQwen35Head(nn.Module):
         self.output_norm = _NativeRMSNorm(dim, eps=config.norm_eps)
         self.output_norm_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
 
+        # Multi-subject ownership head.  These signals are deliberately small
+        # residuals on top of the already Anima-compatible representation:
+        # - slot embeddings distinguish character/subject clauses,
+        # - count embeddings make exact cardinality an explicit global cue,
+        # - binding_gate amplifies each slot's residual from the global centroid.
+        # Gates start at zero so old behaviour is the exact initial condition.
+        max_slots = int(config.max_subject_slots)
+        self.slot_embedding = nn.Embedding(max_slots + 1, dim, padding_idx=0)
+        self.count_embedding = nn.Embedding(max_slots + 1, dim, padding_idx=0)
+        nn.init.normal_(self.slot_embedding.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.count_embedding.weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            self.slot_embedding.weight[0].zero_()
+            self.count_embedding.weight[0].zero_()
+        self.slot_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.count_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.binding_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+
     @property
     def layer_indices(self) -> tuple[int, ...]:
         return tuple(self.native_config.layer_indices)
@@ -189,6 +214,96 @@ class AnimaNativeQwen35Head(nn.Module):
             self.output_proj.weight.lerp_(target_weight.to(self.output_proj.weight), strength)
             self.output_proj.bias.lerp_(target_bias.to(self.output_proj.bias), strength)
 
+    def _apply_binding_controls(
+        self,
+        hidden: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None,
+        group_ids: torch.Tensor | None,
+        subject_counts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Inject slot/count ownership without shifting Anima activation scale.
+
+        PromptPlan groups are treated as subject/semantic slots when supplied by
+        sd_embed.  The operation is residual and followed by a per-token RMS
+        guard so stronger identity binding cannot become a global saturation or
+        contrast shift in the image model.
+        """
+        if group_ids is None and subject_counts is None:
+            zero = hidden.new_zeros(())
+            return hidden, {"slot_gate": zero, "count_gate": zero, "binding_gate": zero}
+
+        base = hidden
+        out = hidden
+        bsz, seq_len, dim = hidden.shape
+        if attention_mask is None:
+            mask = torch.ones((bsz, seq_len), dtype=torch.bool, device=hidden.device)
+        else:
+            mask = attention_mask.to(device=hidden.device).bool()
+            if mask.shape[1] != seq_len:
+                mask = mask[:, :seq_len]
+
+        slot_strength = torch.tanh(self.slot_gate).to(dtype=hidden.dtype)
+        count_strength = torch.tanh(self.count_gate).to(dtype=hidden.dtype)
+        binding_strength = torch.tanh(self.binding_gate).to(dtype=hidden.dtype)
+
+        if group_ids is not None:
+            groups = group_ids.to(device=hidden.device, dtype=torch.long)
+            if groups.shape[1] < seq_len:
+                groups = F.pad(groups, (0, seq_len - groups.shape[1]), value=0)
+            elif groups.shape[1] > seq_len:
+                groups = groups[:, :seq_len]
+            groups = groups.clamp_(0, self.slot_embedding.num_embeddings - 1)
+            slot = self.slot_embedding(groups).to(dtype=hidden.dtype)
+            out = out + slot_strength * slot * mask.unsqueeze(-1).to(hidden.dtype)
+
+            # Keep each subject clause direction distinguishable even when the
+            # same attribute words occur elsewhere.  This is intentionally
+            # centroid-residual based rather than orthogonalisation, which would
+            # distort the 0.6B-compatible geometry too aggressively.
+            if bool(mask.any()):
+                separated = out.clone()
+                for b in range(bsz):
+                    valid = mask[b]
+                    if not bool(valid.any()):
+                        continue
+                    global_center = out[b, valid].mean(dim=0, keepdim=True)
+                    for gid in torch.unique(groups[b, valid]):
+                        idx = valid & (groups[b] == gid)
+                        if not bool(idx.any()):
+                            continue
+                        group_center = out[b, idx].mean(dim=0, keepdim=True)
+                        separated[b, idx] = separated[b, idx] + binding_strength * (group_center - global_center)
+                out = separated
+
+        if subject_counts is not None:
+            counts = subject_counts.to(device=hidden.device, dtype=torch.long).reshape(-1)
+            if counts.numel() == 1 and bsz > 1:
+                counts = counts.expand(bsz)
+            if counts.numel() != bsz:
+                raise ValueError(f"subject_counts must have batch size {bsz}, got {counts.numel()}")
+            counts = counts.clamp_(0, self.count_embedding.num_embeddings - 1)
+            count_vec = self.count_embedding(counts).to(dtype=hidden.dtype).unsqueeze(1)
+            out = out + count_strength * count_vec * mask.unsqueeze(-1).to(hidden.dtype)
+
+        # Saturation/contrast guard: binding may change direction but is not
+        # allowed to inflate or collapse per-token RMS outside a narrow band
+        # around the already-trained Anima-compatible base representation.
+        base_rms = base.float().square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+        out_rms = out.float().square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+        ratio = (out_rms / base_rms).clamp(
+            min=float(self.native_config.binding_rms_min_ratio),
+            max=float(self.native_config.binding_rms_max_ratio),
+        )
+        target_rms = base_rms * ratio
+        out = (out.float() * (target_rms / out_rms)).to(dtype=hidden.dtype)
+        out = torch.where(mask.unsqueeze(-1), out, base)
+        return out, {
+            "slot_gate": slot_strength.float(),
+            "count_gate": count_strength.float(),
+            "binding_gate": binding_strength.float(),
+        }
+
     def _select_layers(self, hidden_states: Sequence[torch.Tensor]) -> list[torch.Tensor]:
         if not hidden_states:
             raise ValueError("Qwen3.5 did not return hidden_states for Anima-native mixing")
@@ -205,6 +320,9 @@ class AnimaNativeQwen35Head(nn.Module):
         self,
         hidden_states: Sequence[torch.Tensor],
         *,
+        attention_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        subject_counts: torch.Tensor | None = None,
         return_details: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         selected = self._select_layers(hidden_states)
@@ -226,6 +344,12 @@ class AnimaNativeQwen35Head(nn.Module):
         projected = self.output_proj(semantic)
         normed = self.output_norm(projected)
         out = projected + torch.tanh(self.output_norm_gate).to(projected.dtype) * (normed - projected)
+        out, binding_details = self._apply_binding_controls(
+            out,
+            attention_mask=attention_mask,
+            group_ids=group_ids,
+            subject_counts=subject_counts,
+        )
 
         if not return_details:
             return out
@@ -235,6 +359,7 @@ class AnimaNativeQwen35Head(nn.Module):
             "semantic": semantic,
             "projected": projected,
             "layer_weights": layer_weights,
+            **binding_details,
         }
 
 
@@ -354,6 +479,8 @@ class AnimaNativeQwen35Encoder(nn.Module):
         return_dict: bool | None = None,
         use_cache: bool | None = False,
         return_native_details: bool = False,
+        anima_group_ids: torch.Tensor | None = None,
+        anima_subject_counts: torch.Tensor | None = None,
         **kwargs: Any,
     ):
         # The native head always requires the backbone hidden-state stack.  Cache
@@ -368,6 +495,9 @@ class AnimaNativeQwen35Encoder(nn.Module):
         )
         native = self.native_head(
             backbone_out.hidden_states,
+            attention_mask=attention_mask,
+            group_ids=anima_group_ids,
+            subject_counts=anima_subject_counts,
             return_details=bool(return_native_details),
         )
         if return_native_details:
@@ -397,6 +527,8 @@ class AnimaNativeQwen35Encoder(nn.Module):
             "hidden_size": int(self.native_head.native_config.hidden_size),
             "intermediate_size": int(self.native_head.native_config.intermediate_size),
             "layer_indices": list(self.native_head.layer_indices),
+            "max_subject_slots": int(self.native_head.native_config.max_subject_slots),
+            "binding_head": "slot_count_group_v2",
             "bridge_required": False,
         }
 
@@ -408,7 +540,11 @@ def native_head_metadata(config: AnimaNativeHeadConfig) -> dict[str, str]:
         "native_layer_indices_json": json.dumps(list(config.layer_indices), separators=(",", ":")),
         "native_norm_eps": f"{float(config.norm_eps):.8g}",
         "native_final_layer_logit_bias": f"{float(config.final_layer_logit_bias):.8g}",
-        "native_layer_mixer": "token_dependent_softmax_v1",
+        "native_max_subject_slots": str(int(config.max_subject_slots)),
+        "native_binding_rms_min_ratio": f"{float(config.binding_rms_min_ratio):.8g}",
+        "native_binding_rms_max_ratio": f"{float(config.binding_rms_max_ratio):.8g}",
+        "native_binding_head": "slot_count_group_v2",
+        "native_layer_mixer": "token_dependent_softmax_v2_full_attention_milestones",
         "native_semantic_block": "rmsnorm_silu_residual_mlp_v1",
         "native_output_projection": "learned_linear_bias_v1",
     }

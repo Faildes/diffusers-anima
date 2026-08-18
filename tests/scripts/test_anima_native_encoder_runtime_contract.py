@@ -132,3 +132,39 @@ def test_native_wrapper_keeps_forward_output_and_checkpointing_contract():
     assert encoder.is_gradient_checkpointing is True
     encoder.gradient_checkpointing_disable()
     assert encoder.is_gradient_checkpointing is False
+
+
+def test_native_binding_head_is_zero_init_compatible_and_rms_bounded():
+    encoder = _make_encoder()
+    ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    mask = torch.ones_like(ids)
+    groups = torch.tensor([[0, 1, 1, 2]], dtype=torch.long)
+    counts = torch.tensor([2], dtype=torch.long)
+
+    plain = encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+    structured = encoder(
+        input_ids=ids,
+        attention_mask=mask,
+        anima_group_ids=groups,
+        anima_subject_counts=counts,
+    ).last_hidden_state
+    # New controls are a strict no-op before training, preserving legacy/0.6B
+    # conditioning behaviour for newly initialised heads.
+    assert torch.allclose(plain, structured, atol=0.0, rtol=0.0)
+
+    with torch.no_grad():
+        encoder.native_head.slot_gate.fill_(2.0)
+        encoder.native_head.count_gate.fill_(2.0)
+        encoder.native_head.binding_gate.fill_(2.0)
+    bound = encoder(
+        input_ids=ids,
+        attention_mask=mask,
+        anima_group_ids=groups,
+        anima_subject_counts=counts,
+    ).last_hidden_state
+    assert not torch.allclose(plain, bound)
+    base_rms = plain.float().square().mean(dim=-1).sqrt()
+    bound_rms = bound.float().square().mean(dim=-1).sqrt()
+    ratio = bound_rms / base_rms.clamp_min(1e-6)
+    assert float(ratio.max()) <= 1.081
+    assert float(ratio.min()) >= 0.919

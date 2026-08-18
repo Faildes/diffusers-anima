@@ -727,6 +727,20 @@ def load_text_encoder_single_file(
             )
             native_head = AnimaNativeQwen35Head(head_config)
             missing_head, unexpected_head = native_head.load_state_dict(native_state, strict=False)
+            # Native-v1 checkpoints produced before the subject-binding head do
+            # not contain the new slot/count parameters.  Their gates are zero
+            # initialised, so accepting only this exact legacy-missing set keeps
+            # runtime output bit-for-bit on the old path until the checkpoint is
+            # retrained.  Any other mismatch remains a hard error.
+            legacy_binding_missing = {
+                "slot_embedding.weight",
+                "count_embedding.weight",
+                "slot_gate",
+                "count_gate",
+                "binding_gate",
+            }
+            if not metadata.get("native_binding_head"):
+                missing_head = [key for key in missing_head if key not in legacy_binding_missing]
             if missing_head or unexpected_head:
                 raise RuntimeError(
                     "Anima-native head tensors do not match the checkpoint metadata. "

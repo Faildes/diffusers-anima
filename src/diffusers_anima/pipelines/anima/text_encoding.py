@@ -454,6 +454,56 @@ def _apply_qwen_plan_factors(
     return anchor + (hidden_states - anchor) * factors
 
 
+def _native_subject_group_ids(
+    plans: list[Any],
+    qwen_groups: torch.Tensor,
+) -> torch.Tensor | None:
+    """Map semantic PromptPlan groups to dense native subject slots.
+
+    sd_embed can use groups for AND/BREAK/semantic weighting that are not
+    people.  Only metadata-declared ``subject_group_ids`` become ownership
+    slots; everything else remains global slot 0.
+    """
+    mapped = torch.zeros_like(qwen_groups)
+    any_subject = False
+    for b, plan in enumerate(plans):
+        raw_ids = getattr(plan, "metadata", {}).get("subject_group_ids", ())
+        try:
+            subject_ids = [int(x) for x in raw_ids]
+        except (TypeError, ValueError):
+            subject_ids = []
+        for slot, original_group in enumerate(subject_ids, start=1):
+            mapped[b] = torch.where(
+                qwen_groups[b] == int(original_group),
+                torch.full_like(mapped[b], int(slot)),
+                mapped[b],
+            )
+            any_subject = True
+    return mapped if any_subject else None
+
+
+def _native_subject_counts(plans: list[Any], *, device: str) -> torch.Tensor | None:
+    """Return exact subject counts declared by structured prompt metadata.
+
+    A value of zero means "unspecified" and therefore contributes only the
+    learned neutral count slot.  Keeping this signal out of free-text parsing
+    in diffusers-anima makes sd_embed the single owner of prompt semantics.
+    """
+    values: list[int] = []
+    has_declared = False
+    for plan in plans:
+        raw = getattr(plan, "metadata", {}).get("subject_count", 0)
+        try:
+            value = max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            value = 0
+        has_declared = has_declared or value > 0
+        values.append(value)
+    if not has_declared:
+        return None
+    return torch.tensor(values, dtype=torch.long, device=device)
+
+
 def prepare_condition_inputs_from_plans(
     prompt_tokenizer: AnimaPromptTokenizer,
     text_encoder: "PreTrainedModel",
@@ -534,9 +584,26 @@ def prepare_condition_inputs_from_plans(
         t5_weights[i, :tlen, 0] = torch.tensor(tf, dtype=torch.float32, device=execution_device)
 
     with torch.inference_mode():
+        native_kwargs: dict[str, Any] = {}
+        if bool(getattr(text_encoder, "_anima_native_encoder", False)):
+            native_groups = _native_subject_group_ids(normalized, qwen_groups)
+            if native_groups is not None:
+                native_kwargs["anima_group_ids"] = native_groups
+            subject_counts = _native_subject_counts(normalized, device=execution_device)
+            if subject_counts is not None:
+                native_kwargs["anima_subject_counts"] = subject_counts
         try:
-            out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask, use_cache=False)
+            out = text_encoder(
+                input_ids=qwen_ids,
+                attention_mask=qwen_mask,
+                use_cache=False,
+                **native_kwargs,
+            )
         except TypeError:
+            # Non-native third-party encoders can have a narrower forward
+            # signature; never drop structured controls from a native encoder.
+            if native_kwargs:
+                raise
             out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
         qwen_hidden = out[0] if isinstance(out, tuple) else out.last_hidden_state
         qwen_hidden = qwen_hidden.to(dtype=model_dtype)

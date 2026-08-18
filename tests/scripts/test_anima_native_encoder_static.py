@@ -30,6 +30,8 @@ def test_training_script_uses_dual_teacher_knowledge_losses():
         'token_geometry_weight',
         'knowledge_gain_weight',
         'distribution_weight',
+        'binding_geometry_weight',
+        'reference_batch_fraction',
         'bootstrap_token_weight',
     ):
         assert marker in source
@@ -53,6 +55,8 @@ def test_native_training_corpus_builds_minimal_and_binding_pairs():
     bindings = module.build_binding_groups(count=8, seed=1)
     assert len(bindings) == 8
     assert all(len(group.texts) == 2 for group in bindings)
+    categories = {group.category for group in module.build_binding_groups(count=25, seed=1)}
+    assert {"binding", "attribute_swap", "count_binding", "multilingual_binding"} <= categories
 
 
 def test_native_encoder_skips_legacy_missing_bridge_warning():
@@ -87,3 +91,46 @@ def test_cuda_indexed_device_uses_cuda_runtime_paths():
     assert namespace["_resolve_effective_cfg_batch_mode"](
         "auto", execution_device="cuda:0"
     ) == "concat"
+
+
+def test_v3_training_is_fixed_budget_balanced_and_best_validation_driven():
+    source = (ROOT / "scripts/train_anima_native_text_encoder.py").read_text(encoding="utf-8")
+    for marker in (
+        'fixed_budget_steps',
+        '_iter_balanced_group_batches',
+        'split_validation_lines',
+        '_build_validation_targets',
+        '_evaluate_validation',
+        '_snapshot_trainable_state',
+        '_restore_trainable_state',
+        'qwen35_fixed_budget_balanced_best_validation_v3',
+        'training_best_step',
+        'validation_neutral_channel',
+    ):
+        assert marker in source
+    ast.parse(source)
+
+
+def test_v3_corpus_validation_size_is_not_a_fraction_of_corpus_and_color_controls_exist():
+    path = ROOT / "scripts/native_training_corpus.py"
+    spec = importlib.util.spec_from_file_location("native_training_corpus_v3_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    lines = [f"1girl, sample {i}, red hair" for i in range(5000)]
+    train, val = module.split_validation_lines(lines, validation_size=128, seed=3)
+    assert len(val) == 128
+    assert len(train) == len(lines) - 128
+    assert not ({x.casefold() for x in train} & {x.casefold() for x in val})
+
+    weights = module.default_sampling_bucket_weights()
+    assert abs(sum(weights.values()) - 1.0) < 1e-6
+    assert weights["binding"] >= weights["color"]
+    controls = module.build_color_control_groups(count=25, seed=4)
+    assert len(controls) == 25
+    assert all(group.category == "color_control" for group in controls)
+    joined = "\n".join(text for group in controls for text in group.texts)
+    assert "high saturation" in joined
+    assert "controlled saturation" in joined

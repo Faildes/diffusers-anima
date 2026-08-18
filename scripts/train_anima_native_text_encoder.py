@@ -27,6 +27,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import sys
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -44,11 +45,15 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from native_training_corpus import (  # noqa: E402
+    ANIMA_COMPAT_ANCHOR_PROMPTS,
     NativePromptGroup,
     build_training_groups,
     corpus_sha256,
+    default_sampling_bucket_weights,
+    group_sampling_bucket,
     preview_training_groups,
     read_prompt_lines,
+    split_validation_lines,
 )
 from diffusers_anima.pipelines.anima.anima_native_text_encoder import (  # noqa: E402
     _NATIVE_ENCODER_FORMAT_V1,
@@ -87,6 +92,16 @@ class NativeEncoderTrainingConfig:
     gradient_accumulation_steps: int = 4
     epochs: int = 1
     max_steps: int = 0
+    # v3 decouples optimiser work from corpus size. max_steps still overrides
+    # this for explicit experiments; otherwise fixed_budget_steps is used.
+    fixed_budget_steps: int = 1000
+    balanced_sampling: bool = True
+    validation_size: int = 192
+    validation_anchor_size: int = 32
+    validation_every: int = 100
+    early_stopping_patience: int = 4
+    early_stopping_min_delta: float = 0.002
+    restore_best_checkpoint: bool = True
     seed: int = 3571
     head_lr: float = 1.0e-4
     backbone_lr: float = 5.0e-6
@@ -97,9 +112,19 @@ class NativeEncoderTrainingConfig:
     gradient_checkpointing: bool = True
     native_intermediate_size: int = 1536
     native_layer_indices: tuple[int, ...] | None = None
-    native_final_layer_logit_bias: float = 6.0
+    native_final_layer_logit_bias: float = 3.0
+    native_max_subject_slots: int = 16
+    native_binding_rms_min_ratio: float = 0.92
+    native_binding_rms_max_ratio: float = 1.08
     pair_fraction: float = 0.35
     binding_pairs: int = 256
+    # The 0.6B model is an Anima-compatibility anchor, not the semantic teacher.
+    # Running it on a deterministic subset keeps that anchor while avoiding a
+    # second LLM forward on every microbatch.
+    reference_batch_fraction: float = 0.50
+    reference_max_length: int = 256
+    fused_adamw: bool = True
+    allow_tf32: bool = True
     # Losses.  Compatibility is important, but source geometry deliberately
     # remains substantial so 0.8B-only distinctions are not collapsed into 0.6B.
     anima_compat_weight: float = 1.00
@@ -107,6 +132,8 @@ class NativeEncoderTrainingConfig:
     token_geometry_weight: float = 0.50
     knowledge_gain_weight: float = 0.75
     distribution_weight: float = 0.20
+    channel_distribution_weight: float = 0.06
+    binding_geometry_weight: float = 0.35
     layer_prior_weight: float = 0.01
     bootstrap_token_weight: float = 0.50
     bootstrap_final_fraction: float = 0.25
@@ -139,12 +166,17 @@ class NativeEncoderTrainingResult:
     training_rows: int
     metadata: Mapping[str, str]
     final_loss: float
+    best_step: int = 0
+    validation_score: float = float("nan")
+    early_stopped: bool = False
 
     def summary(self) -> str:
         return (
             f"native_encoder: {self.output}\n"
-            f"steps={self.steps}; corpus={self.corpus_lines}; rows={self.training_rows}; "
-            f"final_loss={self.final_loss:.6f}; elapsed={self.elapsed_seconds:.1f}s"
+            f"steps={self.steps}; best_step={self.best_step}; corpus={self.corpus_lines}; "
+            f"rows={self.training_rows}; final_loss={self.final_loss:.6f}; "
+            f"val={self.validation_score:.6f}; early_stopped={self.early_stopped}; "
+            f"elapsed={self.elapsed_seconds:.1f}s"
         )
 
 
@@ -498,17 +530,385 @@ def _iter_group_batches(
         yield batch
 
 
-def _tokenize(tokenizer: Any, texts: Sequence[str], *, device: str, max_length: int) -> dict[str, torch.Tensor]:
-    encoded = tokenizer(
-        list(texts),
-        padding=True,
-        truncation=True,
-        max_length=int(max_length),
-        return_tensors="pt",
-    )
-    return {
+def _iter_balanced_group_batches(
+    groups: Sequence[NativePromptGroup],
+    *,
+    row_batch_size: int,
+    rng: random.Random,
+    bucket_weights: Mapping[str, float] | None = None,
+    max_batches: int | None = None,
+) -> Iterable[list[NativePromptGroup]]:
+    """Yield an infinite stratified stream whose mix is corpus-size invariant.
+
+    Each bucket is shuffled into a deck and consumed without replacement until
+    exhausted.  Choosing the next deck uses fixed target weights, never the raw
+    number of rows in that bucket.  Adding 100k similar calibration lines thus
+    increases diversity inside a deck but not its optimiser pressure.
+    """
+    pools: dict[str, list[NativePromptGroup]] = {}
+    for group in groups:
+        pools.setdefault(group_sampling_bucket(group), []).append(group)
+    if not pools:
+        raise ValueError("No training groups available for balanced sampling")
+    weights = dict(default_sampling_bucket_weights())
+    if bucket_weights:
+        weights.update({str(k): max(0.0, float(v)) for k, v in bucket_weights.items()})
+    active = [bucket for bucket in weights if pools.get(bucket) and weights.get(bucket, 0.0) > 0.0]
+    for bucket in pools:
+        if bucket not in active and bucket not in weights:
+            active.append(bucket)
+            weights[bucket] = 0.02
+    if not active:
+        active = sorted(pools)
+        weights = {bucket: 1.0 for bucket in active}
+
+    decks: dict[str, list[NativePromptGroup]] = {}
+    positions: dict[str, int] = {}
+
+    def refill(bucket: str) -> None:
+        deck = list(pools[bucket])
+        rng.shuffle(deck)
+        decks[bucket] = deck
+        positions[bucket] = 0
+
+    def draw(bucket: str) -> NativePromptGroup:
+        if bucket not in decks or positions[bucket] >= len(decks[bucket]):
+            refill(bucket)
+        idx = positions[bucket]
+        positions[bucket] = idx + 1
+        return decks[bucket][idx]
+
+    target_rows = max(2, int(row_batch_size))
+    yielded = 0
+    while max_batches is None or yielded < max(0, int(max_batches)):
+        batch: list[NativePromptGroup] = []
+        rows = 0
+        # Build one row-bounded microbatch.  Paired groups stay atomic.
+        while rows < target_rows:
+            current_active = [b for b in active if pools.get(b)]
+            current_weights = [max(1e-9, float(weights.get(b, 0.0))) for b in current_active]
+            bucket = rng.choices(current_active, weights=current_weights, k=1)[0]
+            group = draw(bucket)
+            needed = len(group.texts)
+            if batch and rows + needed > target_rows:
+                break
+            batch.append(group)
+            rows += needed
+            if rows >= target_rows:
+                break
+        if batch:
+            yield batch
+            yielded += 1
+
+
+_SUBJECT_MARKER_RE = re.compile(
+    r"(?i)(?:^|[;|\n])\s*(?:subject|character|char|person|woman|man|girl|boy)\s*(?:#?\d+|[A-H])\s*:"
+)
+_EXACT_COUNT_RE = re.compile(
+    r"(?i)\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:characters?|people|persons?|girls?|boys?|women|men)\b"
+)
+_COUNT_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _tokenize(
+    tokenizer: Any,
+    texts: Sequence[str],
+    *,
+    device: str,
+    max_length: int,
+    include_offsets: bool = False,
+) -> dict[str, torch.Tensor]:
+    kwargs: dict[str, Any] = {
+        "padding": True,
+        "truncation": True,
+        "max_length": int(max_length),
+        "return_tensors": "pt",
+    }
+    if include_offsets:
+        kwargs["return_offsets_mapping"] = True
+    encoded = tokenizer(list(texts), **kwargs)
+    result = {
         "input_ids": encoded["input_ids"].to(device),
         "attention_mask": encoded["attention_mask"].to(device),
+    }
+    if include_offsets and "offset_mapping" in encoded:
+        # Character offsets are only used by CPU-side prompt structure parsing;
+        # keeping them off the GPU avoids a needless transfer.
+        result["offset_mapping"] = encoded["offset_mapping"].cpu()
+    return result
+
+
+def _infer_training_subject_controls(
+    texts: Sequence[str],
+    offsets: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    *,
+    device: str,
+    max_subject_slots: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Map explicit ``subject N:`` clauses to token slots for binding training."""
+    if offsets is None:
+        return None, None
+    bsz, seq_len = attention_mask.shape
+    group_ids = torch.zeros((bsz, seq_len), dtype=torch.long, device=device)
+    counts = torch.zeros((bsz,), dtype=torch.long, device=device)
+    any_structured = False
+    for b, text in enumerate(texts):
+        matches = list(_SUBJECT_MARKER_RE.finditer(text))
+        count = len(matches)
+        if count <= 0:
+            m = _EXACT_COUNT_RE.search(text)
+            if m is not None:
+                raw = m.group(1).lower()
+                count = int(raw) if raw.isdigit() else int(_COUNT_WORDS.get(raw, 0))
+        if count > 0:
+            counts[b] = min(int(count), int(max_subject_slots))
+        if not matches:
+            continue
+        any_structured = True
+        starts = [m.start() for m in matches]
+        for t in range(min(seq_len, offsets.shape[1])):
+            if int(attention_mask[b, t].item()) <= 0:
+                continue
+            start = int(offsets[b, t, 0].item())
+            # group 0 is global text. Subject clauses start at slot 1.
+            gid = 0
+            for idx, marker_start in enumerate(starts, start=1):
+                if start >= marker_start:
+                    gid = idx
+                else:
+                    break
+            group_ids[b, t] = min(gid, int(max_subject_slots) - 1)
+    if not any_structured and not bool((counts > 0).any()):
+        return None, None
+    return group_ids, counts
+
+
+def _group_binding_geometry_loss(
+    student: torch.Tensor,
+    source: torch.Tensor,
+    mask: torch.Tensor,
+    group_ids: torch.Tensor | None,
+) -> torch.Tensor:
+    """Preserve Qwen3.5 subject-to-subject geometry inside each prompt."""
+    if group_ids is None:
+        return student.new_zeros(())
+    losses: list[torch.Tensor] = []
+    for b in range(student.shape[0]):
+        valid = mask[b].bool()
+        gids = torch.unique(group_ids[b, valid])
+        gids = gids[gids > 0]
+        if gids.numel() < 2:
+            continue
+        s_centers: list[torch.Tensor] = []
+        t_centers: list[torch.Tensor] = []
+        for gid in gids:
+            idx = valid & (group_ids[b] == gid)
+            if not bool(idx.any()):
+                continue
+            s_centers.append(student[b, idx].mean(dim=0))
+            t_centers.append(source[b, idx].detach().mean(dim=0))
+        if len(s_centers) < 2:
+            continue
+        s = F.normalize(torch.stack(s_centers).float(), dim=-1)
+        t = F.normalize(torch.stack(t_centers).float(), dim=-1)
+        gs = s @ s.T
+        gt = t @ t.T
+        keep = ~torch.eye(gs.shape[0], dtype=torch.bool, device=gs.device)
+        losses.append(F.mse_loss(gs[keep], gt[keep]))
+    return torch.stack(losses).mean() if losses else student.new_zeros(())
+
+
+def _channel_distribution_loss(
+    student: torch.Tensor,
+    student_mask: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match channel-level mean/variance to the 0.6B Anima anchor.
+
+    This is deliberately reference-only.  It prevents a learned binding head
+    from changing the global conditioning distribution (a common route to
+    saturation/contrast drift) without suppressing Qwen3.5 semantic geometry.
+    """
+    def stats(x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        xf = x.float()
+        m = mask.to(device=x.device, dtype=torch.float32).unsqueeze(-1)
+        denom = m.sum(dim=(0, 1)).clamp_min(1.0)
+        mean = (xf * m).sum(dim=(0, 1)) / denom
+        var = ((xf - mean) ** 2 * m).sum(dim=(0, 1)) / denom
+        return mean, var.add(1e-6).sqrt()
+    sm, ss = stats(student, student_mask)
+    tm, ts = stats(target, target_mask)
+    # Normalise scale for a stable low-weight regulariser.
+    mean_scale = tm.square().mean().sqrt().clamp_min(1e-3)
+    std_scale = ts.square().mean().sqrt().clamp_min(1e-3)
+    return F.smooth_l1_loss(sm / mean_scale, tm / mean_scale) + 0.5 * F.smooth_l1_loss(ss / std_scale, ts / std_scale)
+
+
+@dataclass(frozen=True)
+class _ValidationTargets:
+    prompts: tuple[str, ...]
+    source_pool: torch.Tensor
+    reference_pool: torch.Tensor
+    neutral_mask: torch.Tensor
+    binding_mask: torch.Tensor
+
+def _validation_prompt_flags(prompts: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    explicit_color = re.compile(
+        r"(?i)\b(?:high saturation|controlled saturation|low saturation|pastel palette|muted earth tones|monochrome|black and white|warm palette|cool palette|neon lighting|colored bounce light)\b"
+    )
+    binding = re.compile(
+        r"(?i)(?:subject\s*(?:#?\d+|[A-H])\s*:|two women|two men|woman and man|duo|trio|group portrait|exactly\s+(?:two|three|four|five|six|\d+)\s+characters)"
+    )
+    neutral = torch.tensor([not bool(explicit_color.search(text)) for text in prompts], dtype=torch.bool)
+    binding_mask = torch.tensor([bool(binding.search(text)) for text in prompts], dtype=torch.bool)
+    return neutral, binding_mask
+
+def _pairwise_distance_matrix(x: torch.Tensor) -> torch.Tensor:
+    z = F.normalize(x.float(), dim=-1)
+    return 1.0 - z @ z.T
+
+def _pooled_channel_drift(student: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    s = student.float()
+    t = target.float()
+    sm, ss = s.mean(dim=0), s.std(dim=0, unbiased=False).clamp_min(1e-5)
+    tm, ts = t.mean(dim=0), t.std(dim=0, unbiased=False).clamp_min(1e-5)
+    mean_scale = tm.square().mean().sqrt().clamp_min(1e-3)
+    std_scale = ts.square().mean().sqrt().clamp_min(1e-3)
+    return F.smooth_l1_loss(sm / mean_scale, tm / mean_scale) + 0.5 * F.smooth_l1_loss(ss / std_scale, ts / std_scale)
+
+def _snapshot_trainable_state(model: AnimaNativeQwen35Encoder) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().to(device="cpu", copy=True)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+def _restore_trainable_state(model: AnimaNativeQwen35Encoder, state: Mapping[str, torch.Tensor]) -> None:
+    parameters = dict(model.named_parameters())
+    with torch.no_grad():
+        for name, value in state.items():
+            parameter = parameters.get(name)
+            if parameter is None:
+                continue
+            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+def _build_validation_targets(
+    student: AnimaNativeQwen35Encoder,
+    reference: torch.nn.Module,
+    source_tok: Any,
+    ref_tok: Any,
+    prompts: Sequence[str],
+    *,
+    device: str,
+    ref_device: str,
+    max_length: int,
+    reference_max_length: int,
+    batch_size: int,
+) -> _ValidationTargets:
+    source_pools: list[torch.Tensor] = []
+    ref_pools: list[torch.Tensor] = []
+    source_was_training = student.backbone.training
+    student.backbone.eval()
+    reference.eval()
+    for start in range(0, len(prompts), max(1, int(batch_size))):
+        batch = list(prompts[start:start + max(1, int(batch_size))])
+        src = _tokenize(source_tok, batch, device=device, max_length=max_length)
+        ref = _tokenize(
+            ref_tok, batch, device=ref_device,
+            max_length=min(max_length, max(32, int(reference_max_length))),
+        )
+        with torch.inference_mode():
+            source_out = student.backbone(
+                input_ids=src["input_ids"], attention_mask=src["attention_mask"],
+                output_hidden_states=True, return_dict=True, use_cache=False,
+            )
+            source_pools.append(_masked_pool(source_out.hidden_states[-1], src["attention_mask"]).float().cpu())
+            ref_out = reference(
+                input_ids=ref["input_ids"], attention_mask=ref["attention_mask"], use_cache=False,
+            )
+            ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out.last_hidden_state
+            ref_pools.append(_masked_pool(ref_hidden, ref["attention_mask"]).float().cpu())
+    if source_was_training:
+        student.backbone.train()
+    neutral, binding = _validation_prompt_flags(prompts)
+    return _ValidationTargets(
+        prompts=tuple(prompts),
+        source_pool=torch.cat(source_pools, dim=0),
+        reference_pool=torch.cat(ref_pools, dim=0),
+        neutral_mask=neutral,
+        binding_mask=binding,
+    )
+
+def _evaluate_validation(
+    student: AnimaNativeQwen35Encoder,
+    source_tok: Any,
+    targets: _ValidationTargets,
+    *,
+    device: str,
+    max_length: int,
+    batch_size: int,
+) -> dict[str, float]:
+    pools: list[torch.Tensor] = []
+    model_was_training = student.training
+    backbone_was_training = student.backbone.training
+    student.eval()
+    for start in range(0, len(targets.prompts), max(1, int(batch_size))):
+        batch = list(targets.prompts[start:start + max(1, int(batch_size))])
+        src = _tokenize(source_tok, batch, device=device, max_length=max_length, include_offsets=True)
+        group_ids, subject_counts = _infer_training_subject_controls(
+            batch, src.get("offset_mapping"), src["attention_mask"],
+            device=device, max_subject_slots=int(student.native_head.native_config.max_subject_slots),
+        )
+        with torch.inference_mode():
+            out = student(
+                input_ids=src["input_ids"], attention_mask=src["attention_mask"],
+                anima_group_ids=group_ids, anima_subject_counts=subject_counts,
+                use_cache=False, return_dict=True,
+            )
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            pools.append(_masked_pool(hidden, src["attention_mask"]).float().cpu())
+    if model_was_training:
+        student.train()
+        if not backbone_was_training:
+            student.backbone.eval()
+
+    student_pool = torch.cat(pools, dim=0)
+    ref_pool = targets.reference_pool
+    source_pool = targets.source_pool
+    compat = _cosine_distance(student_pool, ref_pool).mean() + 0.25 * _normalized_mse(student_pool, ref_pool)
+    geom = F.smooth_l1_loss(_pairwise_distance_matrix(student_pool), _pairwise_distance_matrix(source_pool))
+    neutral = targets.neutral_mask
+    if bool(neutral.any()):
+        channel = _pooled_channel_drift(student_pool[neutral], ref_pool[neutral])
+        srms = student_pool[neutral].square().mean(dim=-1).sqrt().clamp_min(1e-6)
+        rrms = ref_pool[neutral].square().mean(dim=-1).sqrt().clamp_min(1e-6)
+        rms = torch.log(srms / rrms).abs().mean()
+    else:
+        channel = student_pool.new_zeros(())
+        rms = student_pool.new_zeros(())
+    binding_mask = targets.binding_mask
+    if int(binding_mask.sum().item()) >= 2:
+        binding = F.smooth_l1_loss(
+            _pairwise_distance_matrix(student_pool[binding_mask]),
+            _pairwise_distance_matrix(source_pool[binding_mask]),
+        )
+    else:
+        binding = student_pool.new_zeros(())
+    # Compatibility and neutral distribution dominate the safety score; source
+    # geometry/binding protect 0.8B knowledge and concept separation.
+    score = compat + 0.75 * geom + 0.35 * channel + 0.20 * rms + 0.35 * binding
+    return {
+        "score": float(score.item()),
+        "compat": float(compat.item()),
+        "source_geom": float(geom.item()),
+        "neutral_channel": float(channel.item()),
+        "neutral_rms": float(rms.item()),
+        "binding_geom": float(binding.item()),
     }
 
 
@@ -538,6 +938,10 @@ def _save_native_encoder(
     training_rows: int,
     steps: int,
     final_loss: float,
+    best_step: int,
+    validation_metrics: Mapping[str, float],
+    early_stopped: bool,
+    validation_prompts: int,
 ) -> dict[str, str]:
     model.to("cpu")
     source_config = model.backbone.config.to_dict() if hasattr(model.backbone.config, "to_dict") else {}
@@ -569,8 +973,23 @@ def _save_native_encoder(
         "training_steps": str(int(steps)),
         "training_final_loss": f"{float(final_loss):.8g}",
         "training_last_n_layers": str(int(config.train_last_n_layers)),
-        "training_policy": "dual_teacher_knowledge_preserving_native_v1",
-        "knowledge_policy": "preserve_qwen35_geometry_relax_qwen3_reference_on_gain",
+        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v3",
+        "knowledge_policy": "preserve_qwen35_vocab_knowledge_multilingual_geometry_qwen3_is_compat_anchor",
+        "training_budget_mode": "fixed_optimizer_steps",
+        "training_fixed_budget_steps": str(int(config.fixed_budget_steps)),
+        "training_balanced_sampling": "true" if config.balanced_sampling else "false",
+        "training_best_step": str(int(best_step)),
+        "training_early_stopped": "true" if early_stopped else "false",
+        "validation_prompts": str(int(validation_prompts)),
+        "validation_score": f"{float(validation_metrics.get('score', float('nan'))):.8g}",
+        "validation_compat": f"{float(validation_metrics.get('compat', float('nan'))):.8g}",
+        "validation_source_geometry": f"{float(validation_metrics.get('source_geom', float('nan'))):.8g}",
+        "validation_neutral_channel": f"{float(validation_metrics.get('neutral_channel', float('nan'))):.8g}",
+        "validation_neutral_rms": f"{float(validation_metrics.get('neutral_rms', float('nan'))):.8g}",
+        "validation_binding_geometry": f"{float(validation_metrics.get('binding_geom', float('nan'))):.8g}",
+        "sampling_bucket_weights_json": json.dumps(default_sampling_bucket_weights(), sort_keys=True, separators=(",", ":")),
+        "reference_batch_fraction": f"{float(config.reference_batch_fraction):.8g}",
+        "reference_max_length": str(int(config.reference_max_length)),
         "bootstrap_bridge_used": "true" if config.bootstrap_bridge_profile else "false",
         "runtime_conditioning_mode": "native_encoder_direct",
     }
@@ -603,15 +1022,35 @@ def train_anima_native_text_encoder(
     )
 
     lines = read_prompt_lines(cfg.prompts)
+    train_lines, validation_lines = split_validation_lines(
+        lines, validation_size=int(cfg.validation_size), seed=int(cfg.seed),
+    )
     groups = build_training_groups(
-        lines,
+        train_lines,
         pair_fraction=float(cfg.pair_fraction),
         binding_pairs=int(cfg.binding_pairs),
         seed=int(cfg.seed),
     )
     preview = preview_training_groups(groups)
     training_rows = int(preview["rows"])
-    _emit(progress_callback, stage="corpus", prompt_lines=len(lines), **preview)
+    validation_prompts = list(validation_lines)
+    validation_prompts.extend(
+        list(ANIMA_COMPAT_ANCHOR_PROMPTS)[: max(0, int(cfg.validation_anchor_size))]
+    )
+    # Preserve order while removing any overlap between held-out corpus rows and
+    # fixed anchors. Held-out rows never re-enter the optimiser stream.
+    validation_prompts = list(dict.fromkeys(validation_prompts))
+    if not validation_prompts:
+        validation_prompts = [ANIMA_COMPAT_ANCHOR_PROMPTS[0]]
+    _emit(
+        progress_callback,
+        stage="corpus",
+        prompt_lines=len(lines),
+        train_prompt_lines=len(train_lines),
+        validation_prompts=len(validation_prompts),
+        balanced_sampling=bool(cfg.balanced_sampling),
+        **preview,
+    )
 
     _emit(progress_callback, stage="tokenizers", message="loading source tokenizer")
     source_tok = AutoTokenizer.from_pretrained(str(cfg.source_tokenizer))
@@ -640,18 +1079,20 @@ def train_anima_native_text_encoder(
         hidden_size = int(getattr(backbone.config, "hidden_size", 1024))
         layer_indices = cfg.native_layer_indices
         if layer_indices is None:
-            layer_indices = (
-                max(1, round(num_layers * 0.25)),
-                max(1, round(num_layers * 0.50)),
-                max(1, round(num_layers * 0.75)),
-                num_layers,
-            )
+            # Qwen3.5-0.8B has 24 layers with full-attention milestones every
+            # four layers.  Six equal-depth samples therefore preserve both
+            # mid-layer lexical/local information and final semantic knowledge.
+            steps = min(6, max(1, num_layers))
+            layer_indices = tuple(max(1, round(num_layers * i / steps)) for i in range(1, steps + 1))
         head_cfg = AnimaNativeHeadConfig(
             hidden_size=hidden_size,
             intermediate_size=int(cfg.native_intermediate_size),
             layer_indices=tuple(int(x) for x in layer_indices),
             norm_eps=float(getattr(backbone.config, "rms_norm_eps", 1e-6)),
             final_layer_logit_bias=float(cfg.native_final_layer_logit_bias),
+            max_subject_slots=int(cfg.native_max_subject_slots),
+            binding_rms_min_ratio=float(cfg.native_binding_rms_min_ratio),
+            binding_rms_max_ratio=float(cfg.native_binding_rms_max_ratio),
         )
         student = AnimaNativeQwen35Encoder(backbone, AnimaNativeQwen35Head(head_cfg)).to(device=device, dtype=dtype)
         fresh_native = True
@@ -698,7 +1139,26 @@ def train_anima_native_text_encoder(
         # Frozen embeddings feed trainable upper layers.  Some HF checkpointing
         # implementations require the boundary activation itself to carry grad.
         student.enable_input_require_grads()
-    student.train()
+    if backbone_params:
+        student.train()
+    else:
+        # Head-only calibration never needs dropout/training-mode work in the
+        # frozen 0.8B backbone. inference_mode() below can then use the cheapest
+        # safe source forward while gradients still flow through the native head.
+        student.backbone.eval()
+        student.native_head.train()
+
+    validation_targets = _build_validation_targets(
+        student, reference, source_tok, ref_tok, validation_prompts,
+        device=device, ref_device=ref_device, max_length=int(cfg.max_length),
+        reference_max_length=int(cfg.reference_max_length),
+        batch_size=max(4, int(cfg.batch_size)),
+    )
+    initial_validation = _evaluate_validation(
+        student, source_tok, validation_targets,
+        device=device, max_length=int(cfg.max_length), batch_size=max(4, int(cfg.batch_size)),
+    )
+    _emit(progress_callback, stage="validation", step=0, total=0, **{k: f"{v:.6f}" for k, v in initial_validation.items()})
 
     head_params = [p for p in student.native_head.parameters() if p.requires_grad]
     param_groups: list[dict[str, Any]] = [
@@ -710,14 +1170,32 @@ def train_anima_native_text_encoder(
             "lr": float(cfg.backbone_lr),
             "weight_decay": float(cfg.weight_decay),
         })
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+    if device.startswith("cuda") and bool(cfg.allow_tf32):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    adamw_kwargs: dict[str, Any] = {"betas": (0.9, 0.95), "eps": 1e-8}
+    if device.startswith("cuda") and bool(cfg.fused_adamw):
+        adamw_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
+    except (TypeError, RuntimeError):
+        adamw_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
 
     rows_per_epoch = max(1, training_rows)
     micro_steps_per_epoch = max(1, math.ceil(rows_per_epoch / max(1, int(cfg.batch_size))))
     optimizer_steps_per_epoch = max(
         1, math.ceil(micro_steps_per_epoch / max(1, int(cfg.gradient_accumulation_steps)))
     )
-    total_steps = int(cfg.max_steps) if int(cfg.max_steps) > 0 else optimizer_steps_per_epoch * max(1, int(cfg.epochs))
+    # v3: corpus size controls diversity, never optimiser magnitude.  Explicit
+    # max_steps remains an escape hatch; otherwise the fixed budget is used.
+    total_steps = int(cfg.max_steps) if int(cfg.max_steps) > 0 else max(1, int(cfg.fixed_budget_steps))
+    virtual_epochs = max(1, math.ceil(total_steps / optimizer_steps_per_epoch))
     warmup = max(0, round(total_steps * max(0.0, float(cfg.warmup_fraction))))
     _emit(
         progress_callback,
@@ -727,7 +1205,13 @@ def train_anima_native_text_encoder(
         rows=training_rows,
         micro_steps_per_epoch=micro_steps_per_epoch,
         optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        fixed_budget_steps=total_steps,
+        virtual_epochs=virtual_epochs,
+        balanced_sampling=bool(cfg.balanced_sampling),
         gradient_accumulation=int(cfg.gradient_accumulation_steps),
+        reference_batch_fraction=f"{float(cfg.reference_batch_fraction):.3f}",
+        reference_max_length=int(cfg.reference_max_length),
+        fused_adamw=bool(adamw_kwargs.get("fused", False)),
         warmup_steps=warmup,
     )
 
@@ -749,18 +1233,56 @@ def train_anima_native_text_encoder(
     last_optimizer_time = train_started
     ema_step_seconds: float | None = None
     micro_step_global = 0
-    micro_total = max(1, micro_steps_per_epoch * max(1, int(cfg.epochs)))
+    micro_total = max(1, total_steps * max(1, int(cfg.gradient_accumulation_steps)))
+    best_step = 0
+    best_metrics = dict(initial_validation)
+    best_score = float(initial_validation["score"])
+    best_state = _snapshot_trainable_state(student) if bool(cfg.restore_best_checkpoint) else {}
+    stale_validations = 0
+    early_stopped = False
 
-    for epoch in range(max(1, int(cfg.epochs))):
-        if global_step >= total_steps:
+    for epoch in range(virtual_epochs):
+        if global_step >= total_steps or early_stopped:
             break
-        for group_batch in _iter_group_batches(groups, row_batch_size=max(2, int(cfg.batch_size)), rng=rng):
-            if global_step >= total_steps:
+        if cfg.balanced_sampling:
+            batch_iterator = _iter_balanced_group_batches(
+                groups, row_batch_size=max(2, int(cfg.batch_size)), rng=rng,
+                max_batches=micro_steps_per_epoch,
+            )
+        else:
+            batch_iterator = _iter_group_batches(
+                groups, row_batch_size=max(2, int(cfg.batch_size)), rng=rng
+            )
+        for group_batch in batch_iterator:
+            if global_step >= total_steps or early_stopped:
                 break
             micro_step_global += 1
             texts, pairs = _flatten_group_batch(group_batch)
-            src = _tokenize(source_tok, texts, device=device, max_length=int(cfg.max_length))
-            ref = _tokenize(ref_tok, texts, device=ref_device, max_length=int(cfg.max_length))
+            need_offsets = any(_SUBJECT_MARKER_RE.search(text) or _EXACT_COUNT_RE.search(text) for text in texts)
+            src = _tokenize(
+                source_tok,
+                texts,
+                device=device,
+                max_length=int(cfg.max_length),
+                include_offsets=need_offsets,
+            )
+            group_ids, subject_counts = _infer_training_subject_controls(
+                texts,
+                src.get("offset_mapping"),
+                src["attention_mask"],
+                device=device,
+                max_subject_slots=int(student.native_head.native_config.max_subject_slots),
+            )
+
+            # Qwen3-0.6B is intentionally an Anima-distribution anchor, not the
+            # semantic teacher.  Sampling anchor batches avoids a full second
+            # language-model forward on every microbatch while inverse-
+            # probability scaling keeps its expected loss contribution stable.
+            reference_fraction = max(0.05, min(1.0, float(cfg.reference_batch_fraction)))
+            use_reference = micro_step_global == 1 or rng.random() < reference_fraction
+            ref: dict[str, torch.Tensor] | None = None
+            ref_hidden: torch.Tensor | None = None
+            ref_pool: torch.Tensor | None = None
 
             # Head-only stage does not need a graph through the 0.8B backbone.
             backbone_context = torch.enable_grad() if backbone_params else torch.no_grad()
@@ -774,45 +1296,76 @@ def train_anima_native_text_encoder(
                 )
             native_hidden, details = student.native_head(
                 source_out.hidden_states,
+                attention_mask=src["attention_mask"],
+                group_ids=group_ids,
+                subject_counts=subject_counts,
                 return_details=True,
             )
             source_hidden = details["final_hidden"]
 
-            with torch.no_grad():
-                ref_out = reference(
-                    input_ids=ref["input_ids"],
-                    attention_mask=ref["attention_mask"],
-                    use_cache=False,
+            if use_reference:
+                ref = _tokenize(
+                    ref_tok,
+                    texts,
+                    device=ref_device,
+                    max_length=min(int(cfg.max_length), max(32, int(cfg.reference_max_length))),
                 )
-                ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out.last_hidden_state
+                with torch.inference_mode():
+                    ref_out = reference(
+                        input_ids=ref["input_ids"],
+                        attention_mask=ref["attention_mask"],
+                        use_cache=False,
+                    )
+                    ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out.last_hidden_state
 
             student_pool = _masked_pool(native_hidden, src["attention_mask"])
             source_pool = _masked_pool(source_hidden.detach(), src["attention_mask"])
-            ref_pool = _masked_pool(ref_hidden, ref["attention_mask"]).to(device=device, dtype=student_pool.dtype)
+            if ref_hidden is not None and ref is not None:
+                ref_pool = _masked_pool(ref_hidden, ref["attention_mask"]).to(
+                    device=device, dtype=student_pool.dtype
+                )
 
             sample_weights = torch.ones(student_pool.shape[0], device=device, dtype=torch.float32)
             knowledge_losses: list[torch.Tensor] = []
             gains: list[torch.Tensor] = []
-            for a, b, _category in pairs:
+            for a, b, category in pairs:
                 ds = _cosine_distance(source_pool[a:a+1], source_pool[b:b+1]).squeeze(0)
-                dr = _cosine_distance(ref_pool[a:a+1], ref_pool[b:b+1]).squeeze(0)
-                gain = torch.relu(ds - dr) / ds.clamp_min(1e-4)
-                gain = gain.clamp(0.0, 1.0).detach()
                 dstudent = _cosine_distance(student_pool[a:a+1], student_pool[b:b+1]).squeeze(0)
-                knowledge_losses.append(gain * F.smooth_l1_loss(dstudent, ds.detach()))
+                if ref_pool is not None:
+                    dr = _cosine_distance(ref_pool[a:a+1], ref_pool[b:b+1]).squeeze(0)
+                    gain = (torch.relu(ds - dr) / ds.clamp_min(1e-4)).clamp(0.0, 1.0).detach()
+                    relaxed = 1.0 - float(cfg.reference_relax_for_gain) * float(gain.item())
+                    sample_weights[a] *= relaxed
+                    sample_weights[b] *= relaxed
+                else:
+                    # On non-anchor batches Qwen3.5 alone owns semantic truth.
+                    # This is especially important for vocabulary, multilingual
+                    # distinctions, count and attribute-ownership hard negatives.
+                    gain = ds.detach().new_ones(())
+                hard_multiplier = 1.35 if category in {"attribute_swap", "count_binding", "multilingual_binding"} else 1.0
+                knowledge_losses.append(
+                    float(hard_multiplier) * gain * F.smooth_l1_loss(dstudent, ds.detach())
+                )
                 gains.append(gain)
-                relaxed = 1.0 - float(cfg.reference_relax_for_gain) * float(gain.item())
-                sample_weights[a] *= relaxed
-                sample_weights[b] *= relaxed
 
-            compat_each = _cosine_distance(student_pool, ref_pool)
-            compat_each = compat_each + 0.25 * _normalized_mse_each(student_pool, ref_pool)
-            # Apply the same knowledge-aware relaxation to the complete 0.6B
-            # compatibility term so 0.8B-only distinctions are not erased by
-            # the normalised-MSE component either.
-            compat = (compat_each * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+            reference_scale = (1.0 / reference_fraction) if ref_pool is not None else 0.0
+            if ref_pool is not None:
+                compat_each = _cosine_distance(student_pool, ref_pool)
+                compat_each = compat_each + 0.25 * _normalized_mse_each(student_pool, ref_pool)
+                compat = reference_scale * (
+                    (compat_each * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+                )
+            else:
+                compat = student_pool.new_zeros(())
+
             source_geometry = _pairwise_geometry_loss(student_pool, source_pool)
             token_geometry = _token_geometry_loss(native_hidden, source_hidden.detach(), src["attention_mask"])
+            binding_geometry = _group_binding_geometry_loss(
+                native_hidden,
+                source_hidden.detach(),
+                src["attention_mask"],
+                group_ids,
+            )
             knowledge_gain = (
                 torch.stack(knowledge_losses).mean() if knowledge_losses else student_pool.new_zeros(())
             )
@@ -833,18 +1386,30 @@ def train_anima_native_text_encoder(
                     bootstrap_target[src["attention_mask"].bool()],
                 )
 
+            distribution = student_pool.new_zeros(())
+            channel_distribution = student_pool.new_zeros(())
             if bootstrap_target is not None:
-                distribution_target = bootstrap_target
-                distribution_mask = src["attention_mask"]
-            else:
-                distribution_target = ref_hidden.to(device=device, dtype=native_hidden.dtype)
-                distribution_mask = ref["attention_mask"].to(device)
-            distribution = _distribution_loss(
-                native_hidden,
-                src["attention_mask"],
-                distribution_target,
-                distribution_mask,
-            )
+                distribution = _distribution_loss(
+                    native_hidden,
+                    src["attention_mask"],
+                    bootstrap_target,
+                    src["attention_mask"],
+                )
+            elif ref_hidden is not None and ref is not None:
+                ref_target = ref_hidden.to(device=device, dtype=native_hidden.dtype)
+                ref_mask = ref["attention_mask"].to(device)
+                distribution = reference_scale * _distribution_loss(
+                    native_hidden,
+                    src["attention_mask"],
+                    ref_target,
+                    ref_mask,
+                )
+                channel_distribution = reference_scale * _channel_distribution_loss(
+                    native_hidden,
+                    src["attention_mask"],
+                    ref_target,
+                    ref_mask,
+                )
             layer_prior = _layer_prior_loss(details["layer_weights"])
 
             progress = float(global_step) / max(1.0, float(total_steps - 1))
@@ -856,7 +1421,9 @@ def train_anima_native_text_encoder(
                 + float(cfg.source_geometry_weight) * source_geometry
                 + float(cfg.token_geometry_weight) * token_geometry
                 + float(cfg.knowledge_gain_weight) * knowledge_gain
+                + float(cfg.binding_geometry_weight) * binding_geometry
                 + float(cfg.distribution_weight) * distribution
+                + float(cfg.channel_distribution_weight) * channel_distribution
                 + float(cfg.layer_prior_weight) * layer_prior
                 + bootstrap_weight * bootstrap_loss
             )
@@ -870,9 +1437,12 @@ def train_anima_native_text_encoder(
                 "source_geom": float(source_geometry.detach().item()),
                 "token_geom": float(token_geometry.detach().item()),
                 "knowledge": float(knowledge_gain.detach().item()),
+                "binding": float(binding_geometry.detach().item()),
                 "distribution": float(distribution.detach().item()),
+                "channel_dist": float(channel_distribution.detach().item()),
                 "bootstrap": float(bootstrap_loss.detach().item()),
                 "gain": float(torch.stack(gains).mean().item()) if gains else 0.0,
+                "reference": 1.0 if ref_pool is not None else 0.0,
             }
             for key, value in values.items():
                 running[key] = running.get(key, 0.0) + value
@@ -921,14 +1491,57 @@ def train_anima_native_text_encoder(
                         token_geom=f"{avg_values.get('token_geom', values['token_geom']):.6f}",
                         knowledge=f"{avg_values.get('knowledge', values['knowledge']):.6f}",
                         distribution=f"{avg_values.get('distribution', values['distribution']):.6f}",
+                        binding=f"{avg_values.get('binding', values['binding']):.6f}",
+                        reference=f"{avg_values.get('reference', values['reference']):.3f}",
                         bootstrap=f"{avg_values.get('bootstrap', values['bootstrap']):.6f}",
                     )
                     running.clear()
 
-            del source_out, native_hidden, details, source_hidden, ref_out, ref_hidden
+                validation_due = (
+                    int(cfg.validation_every) > 0
+                    and (global_step % max(1, int(cfg.validation_every)) == 0 or global_step >= total_steps)
+                )
+                if validation_due:
+                    metrics = _evaluate_validation(
+                        student, source_tok, validation_targets,
+                        device=device, max_length=int(cfg.max_length),
+                        batch_size=max(4, int(cfg.batch_size)),
+                    )
+                    score = float(metrics["score"])
+                    improvement = max(0.0, float(cfg.early_stopping_min_delta))
+                    threshold = best_score * (1.0 - improvement)
+                    improved = score < threshold
+                    if improved:
+                        best_score = score
+                        best_step = global_step
+                        best_metrics = dict(metrics)
+                        stale_validations = 0
+                        if bool(cfg.restore_best_checkpoint):
+                            best_state = _snapshot_trainable_state(student)
+                    else:
+                        stale_validations += 1
+                    _emit(
+                        progress_callback,
+                        stage="validation",
+                        step=global_step,
+                        total=total_steps,
+                        best_step=best_step,
+                        improved=improved,
+                        stale=stale_validations,
+                        **{k: f"{v:.6f}" for k, v in metrics.items()},
+                    )
+                    if (
+                        int(cfg.early_stopping_patience) > 0
+                        and stale_validations >= int(cfg.early_stopping_patience)
+                    ):
+                        early_stopped = True
+
+            del source_out, native_hidden, details, source_hidden
+            if ref_hidden is not None:
+                del ref_hidden
 
         # Flush a partial accumulation at the epoch boundary.
-        if accum > 0 and global_step < total_steps:
+        if accum > 0 and global_step < total_steps and not early_stopped:
             torch.nn.utils.clip_grad_norm_(
                 [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None],
                 max_norm=float(cfg.max_grad_norm),
@@ -958,6 +1571,20 @@ def train_anima_native_text_encoder(
                 step_seconds_ema=f"{float(ema_step_seconds):.3f}",
             )
 
+    if bool(cfg.restore_best_checkpoint) and best_state:
+        _restore_trainable_state(student, best_state)
+        # The final artifact is always the best validation checkpoint, never the
+        # last optimiser step. This is the main guard against saturation drift.
+        final_metrics = _evaluate_validation(
+            student, source_tok, validation_targets,
+            device=device, max_length=int(cfg.max_length),
+            batch_size=max(4, int(cfg.batch_size)),
+        )
+        best_metrics = dict(final_metrics)
+        best_score = float(final_metrics["score"])
+    elif best_step == 0:
+        best_step = global_step
+
     output = Path(cfg.output)
     _emit(progress_callback, stage="save", message="serialising native encoder", output=str(output))
     metadata = _save_native_encoder(
@@ -968,6 +1595,10 @@ def train_anima_native_text_encoder(
         training_rows=training_rows,
         steps=global_step,
         final_loss=last_loss,
+        best_step=best_step,
+        validation_metrics=best_metrics,
+        early_stopped=early_stopped,
+        validation_prompts=len(validation_targets.prompts),
     )
     elapsed = time.perf_counter() - started
     result = NativeEncoderTrainingResult(
@@ -978,6 +1609,9 @@ def train_anima_native_text_encoder(
         training_rows=training_rows,
         metadata=metadata,
         final_loss=last_loss,
+        best_step=best_step,
+        validation_score=best_score,
+        early_stopped=early_stopped,
     )
     _emit(
         progress_callback,
@@ -985,6 +1619,9 @@ def train_anima_native_text_encoder(
         step=global_step,
         total=max(global_step, total_steps),
         loss=f"{last_loss:.6f}",
+        best_step=best_step,
+        validation_score=f"{best_score:.6f}",
+        early_stopped=early_stopped,
         output=output,
         elapsed_seconds=f"{elapsed:.3f}",
         eta_seconds="0",
@@ -1021,15 +1658,25 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--gradient-accumulation-steps", type=int, default=4)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max-steps", type=int, default=0)
+    p.add_argument("--fixed-budget-steps", type=int, default=1000)
+    p.add_argument("--no-balanced-sampling", action="store_true")
+    p.add_argument("--validation-size", type=int, default=192)
+    p.add_argument("--validation-anchor-size", type=int, default=32)
+    p.add_argument("--validation-every", type=int, default=100)
+    p.add_argument("--early-stopping-patience", type=int, default=4)
+    p.add_argument("--early-stopping-min-delta", type=float, default=0.002)
+    p.add_argument("--no-restore-best-checkpoint", action="store_true")
     p.add_argument("--head-lr", type=float, default=1e-4)
     p.add_argument("--backbone-lr", type=float, default=5e-6)
     p.add_argument("--train-last-n-layers", type=int, default=0)
     p.add_argument("--native-intermediate-size", type=int, default=1536)
-    p.add_argument("--native-layer-indices", default=None, help="e.g. 6,12,18,24")
+    p.add_argument("--native-layer-indices", default=None, help="e.g. 4,8,12,16,20,24")
     p.add_argument("--pair-fraction", type=float, default=0.35)
     p.add_argument("--binding-pairs", type=int, default=256)
+    p.add_argument("--reference-batch-fraction", type=float, default=0.50)
+    p.add_argument("--reference-max-length", type=int, default=256)
     p.add_argument("--seed", type=int, default=3571)
-    p.add_argument("--log-every", type=int, default=1)
+    p.add_argument("--log-every", type=int, default=10)
     return p
 
 
@@ -1053,6 +1700,14 @@ def main() -> None:
         gradient_accumulation_steps=a.gradient_accumulation_steps,
         epochs=a.epochs,
         max_steps=a.max_steps,
+        fixed_budget_steps=a.fixed_budget_steps,
+        balanced_sampling=not a.no_balanced_sampling,
+        validation_size=a.validation_size,
+        validation_anchor_size=a.validation_anchor_size,
+        validation_every=a.validation_every,
+        early_stopping_patience=a.early_stopping_patience,
+        early_stopping_min_delta=a.early_stopping_min_delta,
+        restore_best_checkpoint=not a.no_restore_best_checkpoint,
         head_lr=a.head_lr,
         backbone_lr=a.backbone_lr,
         train_last_n_layers=a.train_last_n_layers,
@@ -1060,6 +1715,8 @@ def main() -> None:
         native_layer_indices=_parse_layer_indices(a.native_layer_indices),
         pair_fraction=a.pair_fraction,
         binding_pairs=a.binding_pairs,
+        reference_batch_fraction=a.reference_batch_fraction,
+        reference_max_length=a.reference_max_length,
         seed=a.seed,
         log_every=a.log_every,
     )
