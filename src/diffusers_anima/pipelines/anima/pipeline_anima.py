@@ -88,6 +88,15 @@ from .validation import (
     _warn_ignored_sampling_arguments,
 )
 
+
+def _execution_device_type(execution_device: str | torch.device) -> str:
+    """Normalize device strings such as ``cuda:0`` to their backend type."""
+    try:
+        return torch.device(execution_device).type
+    except (TypeError, RuntimeError):
+        return str(execution_device).split(":", 1)[0].lower()
+
+
 @contextmanager
 def _module_execution_context(
     module: torch.nn.Module,
@@ -96,13 +105,14 @@ def _module_execution_context(
     execution_dtype: torch.dtype,
     enable_offload: bool,
 ) -> Iterator[None]:
-    if enable_offload and execution_device != "cpu":
+    device_type = _execution_device_type(execution_device)
+    if enable_offload and device_type != "cpu":
         module.to(device=execution_device, dtype=execution_dtype)
         try:
             yield
         finally:
             module.to(device="cpu")
-            if execution_device == "cuda":
+            if device_type == "cuda":
                 torch.cuda.empty_cache()
         return
 
@@ -132,7 +142,7 @@ def _resolve_sample_dtype(
         raise ValueError(f"Unsupported sample_dtype: {sample_dtype}")
     if mapped is not None:
         return mapped
-    if execution_device in {"cuda", "mps"} and model_dtype in {
+    if _execution_device_type(execution_device) in {"cuda", "mps"} and model_dtype in {
         torch.float16,
         torch.bfloat16,
     }:
@@ -145,7 +155,7 @@ def _resolve_effective_cfg_batch_mode(cfg_batch_mode: str, *, execution_device: 
     if cfg_batch_mode == "auto":
         # CUDA benefits most from the Diffusers-style batched CFG forward. CPU/MPS
         # often prefer lower peak memory and avoid the doubled batch.
-        return "concat" if execution_device == "cuda" else "split"
+        return "concat" if _execution_device_type(execution_device) == "cuda" else "split"
     return cfg_batch_mode
 
 
@@ -190,6 +200,7 @@ def _prepare_prompt_embedding_inputs(
         family = _active_text_encoder_family(pipe.text_encoder)
         if (
             family == "qwen3.5"
+            and not bool(getattr(pipe.text_encoder, "_anima_native_encoder", False))
             and pipe.text_encoder_bridge is None
             and pipe.text_encoder_conditioner is None
             and not getattr(pipe, "_anima_warned_missing_bridge", False)

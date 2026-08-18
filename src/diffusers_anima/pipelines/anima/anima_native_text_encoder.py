@@ -238,8 +238,61 @@ class AnimaNativeQwen35Head(nn.Module):
         }
 
 
+def _module_runtime_dtype(module: nn.Module) -> torch.dtype:
+    """Return a Diffusers/Transformers-compatible runtime dtype for ``module``.
+
+    Plain ``torch.nn.Module`` intentionally has no ``dtype`` property, while
+    both Diffusers and Transformers model classes expose one.  The native Qwen
+    wrapper is registered as a pipeline component, so DiffusionPipeline.to()
+    also expects that contract.  Prefer an existing model property and fall
+    back to the first floating/complex parameter or buffer.
+    """
+    try:
+        dtype = getattr(module, "dtype", None)
+    except (AttributeError, RuntimeError):
+        dtype = None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    fallback: torch.dtype | None = None
+    for tensors in (module.parameters(), module.buffers()):
+        for tensor in tensors:
+            fallback = tensor.dtype
+            if tensor.is_floating_point() or tensor.is_complex():
+                return tensor.dtype
+    return fallback or torch.float32
+
+
+def _module_runtime_device(module: nn.Module) -> torch.device:
+    """Return a Diffusers/Transformers-compatible runtime device for ``module``."""
+    try:
+        device = getattr(module, "device", None)
+    except (AttributeError, RuntimeError):
+        device = None
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, (str, int)):
+        try:
+            return torch.device(device)
+        except (TypeError, RuntimeError):
+            pass
+
+    for tensors in (module.parameters(), module.buffers()):
+        for tensor in tensors:
+            return tensor.device
+    return torch.device("cpu")
+
+
 class AnimaNativeQwen35Encoder(nn.Module):
-    """Qwen3.5-0.8B backbone with an integrated Anima-native output head."""
+    """Qwen3.5-0.8B backbone with an integrated Anima-native output head.
+
+    This is intentionally a lightweight ``nn.Module`` wrapper rather than a
+    second ``PreTrainedModel``.  It nevertheless exposes the small runtime
+    interface (notably ``dtype`` and ``device``) expected from registered
+    Diffusers/Transformers model components.
+    """
+
+    main_input_name = "input_ids"
 
     def __init__(self, backbone: nn.Module, native_head: AnimaNativeQwen35Head):
         super().__init__()
@@ -250,6 +303,25 @@ class AnimaNativeQwen35Encoder(nn.Module):
         self._anima_source_text_encoder_family = "qwen3.5"
         self._anima_native_encoder = True
         self._anima_conditioning_ready = True
+
+    @property
+    def dtype(self) -> torch.dtype:
+        # DiffusionPipeline.to() unconditionally inspects ``module.dtype`` for
+        # registered torch modules after moving them.  Delegate to the Qwen
+        # backbone so the wrapper behaves like a Transformers model.
+        return _module_runtime_dtype(self.backbone)
+
+    @property
+    def device(self) -> torch.device:
+        # DiffusionPipeline.device and several offload/device helpers expect the
+        # same property that PreTrainedModel exposes.
+        return _module_runtime_device(self.backbone)
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        # Keep training/tooling introspection compatible with the wrapped Qwen
+        # model without changing the wrapper's state-dict layout.
+        return bool(getattr(self.backbone, "is_gradient_checkpointing", False))
 
     def get_input_embeddings(self):
         getter = getattr(self.backbone, "get_input_embeddings", None)

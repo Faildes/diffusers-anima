@@ -53,3 +53,37 @@ def test_native_training_corpus_builds_minimal_and_binding_pairs():
     bindings = module.build_binding_groups(count=8, seed=1)
     assert len(bindings) == 8
     assert all(len(group.texts) == 2 for group in bindings)
+
+
+def test_native_encoder_skips_legacy_missing_bridge_warning():
+    source = (ROOT / "src/diffusers_anima/pipelines/anima/pipeline_anima.py").read_text(encoding="utf-8")
+    assert 'and not bool(getattr(pipe.text_encoder, "_anima_native_encoder", False))' in source
+    ast.parse(source)
+
+
+def test_cuda_indexed_device_uses_cuda_runtime_paths():
+    source = (ROOT / "src/diffusers_anima/pipelines/anima/pipeline_anima.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_execution_device_type", "_resolve_sample_dtype", "_resolve_effective_cfg_batch_mode"}
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    assert {node.name for node in functions} == wanted
+
+    namespace = {
+        "torch": __import__("torch"),
+        "DTYPE_MAP": {
+            "auto": None,
+            "float16": __import__("torch").float16,
+            "bfloat16": __import__("torch").bfloat16,
+            "float32": __import__("torch").float32,
+        },
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "<pipeline-runtime-test>", "exec"), namespace)
+
+    torch = namespace["torch"]
+    assert namespace["_execution_device_type"]("cuda:0") == "cuda"
+    assert namespace["_resolve_sample_dtype"](
+        "auto", model_dtype=torch.bfloat16, execution_device="cuda:0"
+    ) == torch.bfloat16
+    assert namespace["_resolve_effective_cfg_batch_mode"](
+        "auto", execution_device="cuda:0"
+    ) == "concat"
