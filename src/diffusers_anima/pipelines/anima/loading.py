@@ -39,6 +39,12 @@ from .constants import (
 from .options import AnimaComponents, AnimaLoaderOptions, AnimaRuntimeOptions
 from .text_encoding import AnimaPromptTokenizer
 from .text_encoder_bridge import read_text_encoder_profile_metadata
+from .anima_native_text_encoder import (
+    AnimaNativeHeadConfig,
+    AnimaNativeQwen35Encoder,
+    AnimaNativeQwen35Head,
+    is_anima_native_text_encoder_metadata,
+)
 from .vae_conversion import convert_anima_vae_state_dict
 
 # ---------------------------------------------------------------------------
@@ -638,26 +644,40 @@ def load_text_encoder_single_file(
         metadata.get("format") == "anima_text_encoder_v3"
         and metadata.get("artifact_kind") == "final_encoder"
     )
-    packaged_encoder = profile_format or final_encoder_format
+    native_encoder_format = is_anima_native_text_encoder_metadata(metadata)
+    packaged_encoder = profile_format or final_encoder_format or native_encoder_format
 
-    state_dict = load_file(file_path, device="cpu")
+    raw_state_dict = load_file(file_path, device="cpu")
+    native_state: dict[str, torch.Tensor] = {}
     if packaged_encoder:
         if metadata.get("contains_encoder_weights", "false").lower() != "true":
             raise ValueError(
-                "This Anima text-encoder profile contains bridge calibration only and cannot be used "
-                "directly as encoder_path. Load the source encoder separately and call "
-                "pipe.load_text_encoder_bridge(profile_path), or create the profile with "
-                "--bundle-source-weights."
+                "This Anima text-encoder artifact does not contain encoder weights and cannot be used "
+                "directly as encoder_path."
             )
         state_dict = {
             key[len("encoder."):]: value
-            for key, value in state_dict.items()
+            for key, value in raw_state_dict.items()
             if key.startswith("encoder.")
         }
         if not state_dict:
-            raise RuntimeError("Aligned encoder profile metadata says weights are bundled, but encoder.* tensors are missing.")
+            raise RuntimeError(
+                "Packaged encoder metadata says weights are bundled, but encoder.* tensors are missing."
+            )
+        if native_encoder_format:
+            native_state = {
+                key[len("native."):]: value
+                for key, value in raw_state_dict.items()
+                if key.startswith("native.")
+            }
+            if not native_state:
+                raise RuntimeError(
+                    "Anima-native encoder metadata is present, but native.* tensors are missing."
+                )
         family = metadata.get("source_family", "qwen3.5")
+        del raw_state_dict
     else:
+        state_dict = raw_state_dict
         family = _detect_text_encoder_family(state_dict)
 
     source_config_json = metadata.get("source_config_json") if packaged_encoder else None
@@ -666,7 +686,7 @@ def load_text_encoder_single_file(
         try:
             source_config = json.loads(source_config_json)
         except json.JSONDecodeError as exc:
-            raise ValueError("Aligned encoder profile contains invalid source_config_json metadata.") from exc
+            raise ValueError("Packaged encoder contains invalid source_config_json metadata.") from exc
 
     if family == "qwen3.5":
         try:
@@ -679,13 +699,13 @@ def load_text_encoder_single_file(
         text_state = dict(state_dict) if packaged_encoder else _extract_qwen35_text_state_dict(state_dict)
         del state_dict
         config = Qwen3_5TextConfig(**(source_config or QWEN35_08B_TEXT_CONFIG))
-        text_encoder = Qwen3_5TextModel(config)
-        expected_keys = set(text_encoder.state_dict().keys())
+        backbone = Qwen3_5TextModel(config)
+        expected_keys = set(backbone.state_dict().keys())
         filtered_text_state = {
             key: value for key, value in text_state.items() if key in expected_keys
         }
         ignored_auxiliary = sorted(set(text_state) - set(filtered_text_state))
-        missing, unexpected = text_encoder.load_state_dict(filtered_text_state, strict=False)
+        missing, unexpected = backbone.load_state_dict(filtered_text_state, strict=False)
         if missing or unexpected:
             raise RuntimeError(
                 "Text encoder weights do not match expected Qwen3.5 text architecture. "
@@ -698,10 +718,38 @@ def load_text_encoder_single_file(
                 f"{len(ignored_auxiliary)} tensors (for example {ignored_auxiliary[:4]}).",
                 stacklevel=2,
             )
-        setattr(text_encoder, "_anima_text_encoder_family", "qwen3.5")
-        tokenizer_source = metadata.get("source_tokenizer", _QWEN35_TOKENIZER_SOURCE) if packaged_encoder else _QWEN35_TOKENIZER_SOURCE
+
+        if native_encoder_format:
+            head_config = AnimaNativeHeadConfig.from_metadata(
+                metadata,
+                num_layers=int(getattr(config, "num_hidden_layers", 24)),
+                hidden_size=int(getattr(config, "hidden_size", 1024)),
+            )
+            native_head = AnimaNativeQwen35Head(head_config)
+            missing_head, unexpected_head = native_head.load_state_dict(native_state, strict=False)
+            if missing_head or unexpected_head:
+                raise RuntimeError(
+                    "Anima-native head tensors do not match the checkpoint metadata. "
+                    f"Missing: {len(missing_head)}, Unexpected: {len(unexpected_head)}; "
+                    f"first missing={missing_head[:8]}, first unexpected={unexpected_head[:8]}"
+                )
+            text_encoder = AnimaNativeQwen35Encoder(backbone, native_head)
+            setattr(text_encoder, "_anima_native_encoder_metadata", metadata)
+            setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
+            setattr(text_encoder, "_anima_native_encoder_path", str(file_path))
+            setattr(text_encoder, "_anima_conditioning_ready", True)
+        else:
+            text_encoder = backbone
+            setattr(text_encoder, "_anima_text_encoder_family", "qwen3.5")
+
+        tokenizer_source = (
+            metadata.get("source_tokenizer", _QWEN35_TOKENIZER_SOURCE)
+            if packaged_encoder else _QWEN35_TOKENIZER_SOURCE
+        )
         setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
     else:
+        if native_encoder_format:
+            raise ValueError("anima_native_text_encoder_v1 currently supports a Qwen3.5 source backbone only")
         if not packaged_encoder:
             state_dict = _strip_model_prefix(state_dict)
         config = Qwen3Config(**(source_config or QWEN3_06B_CONFIG))
@@ -714,7 +762,10 @@ def load_text_encoder_single_file(
             )
         del state_dict
         setattr(text_encoder, "_anima_text_encoder_family", "qwen3")
-        tokenizer_source = metadata.get("source_tokenizer", _QWEN_TOKENIZER_SOURCE) if packaged_encoder else _QWEN_TOKENIZER_SOURCE
+        tokenizer_source = (
+            metadata.get("source_tokenizer", _QWEN_TOKENIZER_SOURCE)
+            if packaged_encoder else _QWEN_TOKENIZER_SOURCE
+        )
         setattr(text_encoder, "_anima_tokenizer_source", tokenizer_source)
 
     if profile_format:
@@ -723,12 +774,15 @@ def load_text_encoder_single_file(
         setattr(text_encoder, "_anima_embedded_bridge_path", str(file_path))
         setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
     elif final_encoder_format:
-        # v3 is a single-file final encoder: the Qwen backbone remains intact,
-        # while the embedded conditioning head is loaded as part of the encoder
-        # runtime rather than exposed as a separate bridge artifact.
+        # v3 keeps an external runtime conditioner for backwards compatibility.
         setattr(text_encoder, "_anima_embedded_conditioner_path", str(file_path))
         setattr(text_encoder, "_anima_text_encoder_profile_metadata", metadata)
         setattr(text_encoder, "_anima_final_encoder_artifact", True)
+    elif native_encoder_format:
+        # Native v1 needs no bridge/conditioner attachment.  The text encoder's
+        # own forward() already returns the Anima-ready memory.
+        setattr(text_encoder, "_anima_native_encoder", True)
+        setattr(text_encoder, "_anima_conditioning_ready", True)
 
     text_encoder.to(dtype=dtype)
     text_encoder.eval().requires_grad_(False)

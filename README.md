@@ -116,6 +116,7 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
 | [`docs/text_encoder_profiles.md`](docs/text_encoder_profiles.md) | Qwen3.5/alternate encoder compatibility profile format |
+| [`docs/native_text_encoder.md`](docs/native_text_encoder.md) | Bridge-free Anima-native Qwen3.5-0.8B training and runtime format |
 | [`docs/final_encoder_v4_stability.md`](docs/final_encoder_v4_stability.md) | v3 final encoder + v4 saturation/binding stability layer |
 
 ## Long prompts beyond 512 tokens
@@ -190,6 +191,16 @@ held-out validation metrics, recommended center/variance strengths, and optional
 future `bridge.input_projection` support for wider encoders. Calibration uses no
 gradients or optimizer.
 
+
+
+## Anima-native Qwen3.5-0.8B encoder
+
+For the bridge-free final path, train an `anima_native_text_encoder_v1` checkpoint with
+`scripts/train_anima_native_text_encoder.py`.  It retains the Qwen3.5-0.8B backbone,
+adds an integrated trainable multi-layer Anima head, and uses the Qwen3-0.6B encoder
+only as a compatibility reference during training.  The resulting single safetensors
+file is passed directly as `encoder_path`; no runtime bridge or v3 conditioner is
+attached. See [`docs/native_text_encoder.md`](docs/native_text_encoder.md).
 
 ## Final Anima text encoder v3
 

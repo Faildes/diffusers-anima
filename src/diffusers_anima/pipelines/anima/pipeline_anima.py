@@ -745,6 +745,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         out calibration split.  The same file may be a small bridge profile or a
         self-contained aligned encoder artifact with embedded ``encoder.*`` weights.
         """
+        if bool(getattr(self.text_encoder, "_anima_native_encoder", False)):
+            raise RuntimeError(
+                "The active text encoder is already Anima-native and must not be passed through a runtime bridge."
+            )
         bridge = AnimaTextEncoderBridge.from_file(
             path,
             center_strength=center_strength,
@@ -795,6 +799,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         to Anima, and optional semantic slots add a conservative source-preserving
         view rather than replacing the aligned token stream.
         """
+        if bool(getattr(self.text_encoder, "_anima_native_encoder", False)):
+            raise RuntimeError(
+                "The active text encoder is already Anima-native and must not attach a v3 runtime conditioner."
+            )
         conditioner = AnimaTextEncoderConditioner.from_file(
             path,
             center_strength=center_strength,
@@ -830,13 +838,17 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """Describe the active encoder and its compatibility profile."""
         family = _active_text_encoder_family(self.text_encoder)
         config = getattr(self.text_encoder, "config", None)
+        native_encoder = bool(getattr(self.text_encoder, "_anima_native_encoder", False))
         result: dict[str, Any] = {
             "encoder_family": family,
             "encoder_hidden_size": int(getattr(config, "hidden_size", 0) or 0),
             "bridge_attached": self.text_encoder_bridge is not None,
             "conditioner_attached": self.text_encoder_conditioner is not None,
+            "native_encoder": native_encoder,
+            "bridge_required": False if native_encoder else None,
             "anima_ready": (
                 family == "qwen3"
+                or native_encoder
                 or self.text_encoder_bridge is not None
                 or self.text_encoder_conditioner is not None
                 or bool(getattr(self.text_encoder, "_anima_conditioning_ready", False))
@@ -850,6 +862,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             result["bridge"] = self.text_encoder_bridge.describe()
         if self.text_encoder_conditioner is not None:
             result["conditioner"] = self.text_encoder_conditioner.describe()
+        if native_encoder:
+            describe_native = getattr(self.text_encoder, "native_description", None)
+            if callable(describe_native):
+                result["native"] = describe_native()
         try:
             result["adapter_long_context"] = self.describe_adapter_long_context()
         except Exception:
@@ -859,6 +875,8 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     def set_text_encoder_bridge(
         self, bridge: AnimaTextEncoderBridge | None
     ) -> "AnimaPipeline":
+        if bridge is not None and bool(getattr(self.text_encoder, "_anima_native_encoder", False)):
+            raise RuntimeError("An Anima-native encoder must not attach a legacy bridge.")
         self.text_encoder_bridge = bridge
         if bridge is not None:
             self.text_encoder_conditioner = None
@@ -869,25 +887,39 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         if self.text_encoder_bridge is not None:
             self.text_encoder_bridge.clear_runtime_cache()
         self.text_encoder_bridge = None
-        setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        setattr(
+            self.text_encoder,
+            "_anima_conditioning_ready",
+            bool(getattr(self.text_encoder, "_anima_native_encoder", False)),
+        )
         return self
 
     def set_text_encoder_conditioner(
         self, conditioner: AnimaTextEncoderConditioner | None
     ) -> "AnimaPipeline":
+        if conditioner is not None and bool(getattr(self.text_encoder, "_anima_native_encoder", False)):
+            raise RuntimeError("An Anima-native encoder must not attach a v3 runtime conditioner.")
         self.text_encoder_conditioner = conditioner
         if conditioner is not None:
             self.text_encoder_bridge = None
             setattr(self.text_encoder, "_anima_conditioning_ready", True)
         else:
-            setattr(self.text_encoder, "_anima_conditioning_ready", False)
+            setattr(
+                self.text_encoder,
+                "_anima_conditioning_ready",
+                bool(getattr(self.text_encoder, "_anima_native_encoder", False)),
+            )
         return self
 
     def clear_text_encoder_conditioner(self) -> "AnimaPipeline":
         if self.text_encoder_conditioner is not None:
             self.text_encoder_conditioner.clear_runtime_cache()
         self.text_encoder_conditioner = None
-        setattr(self.text_encoder, "_anima_conditioning_ready", False)
+        setattr(
+            self.text_encoder,
+            "_anima_conditioning_ready",
+            bool(getattr(self.text_encoder, "_anima_native_encoder", False)),
+        )
         return self
 
     def set_text_encoder_conditioning_stability(
@@ -939,6 +971,11 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 token_rms_max_ratio=token_rms_max_ratio,
             )
             return self
+        if bool(getattr(self.text_encoder, "_anima_native_encoder", False)):
+            raise RuntimeError(
+                "The active encoder is Anima-native; bridge/conditioner stability knobs do not apply. "
+                "Adjust the native checkpoint by training rather than runtime alignment."
+            )
         raise RuntimeError("No Anima text-encoder bridge or final conditioner is active.")
 
     def set_semantic_expansion(
