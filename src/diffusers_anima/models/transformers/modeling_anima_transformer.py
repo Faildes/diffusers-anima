@@ -251,15 +251,21 @@ class _AdapterAttention(nn.Module):
         router_top_k: int,
         router_temperature: float,
         locality_strength: float,
+        router_floor: float,
+        rms_min_ratio: float,
+        rms_max_ratio: float,
     ) -> torch.Tensor:
         """Attend to arbitrary source length through native-size memory banks.
 
         A single global softmax over >512 source tokens changes the entropy and
         positional regime that the frozen Anima adapter saw during training.
         Instead, every bank performs ordinary <=512-token attention with local
-        RoPE positions.  A second, length-normalised router chooses a small
-        number of relevant banks per target token/head.  The result still has
-        the native target length, so the downstream DiT contract is unchanged.
+        RoPE positions.  v5 defaults to *full coverage*: every source bank
+        participates in the final mixture (router_top_k=0), so no source window
+        is dropped. A small uniform routing floor can keep low-scoring banks
+        numerically alive, while an RMS guard keeps the mixed residual inside
+        the magnitude range of the native-size bank outputs. The result keeps
+        the trained target length and downstream DiT contract unchanged.
         """
         source_len = int(context.shape[1])
         starts = _build_long_context_window_starts(
@@ -346,11 +352,35 @@ class _AdapterAttention(nn.Module):
             keep.scatter_(0, top_indices, True)
             logits = logits.masked_fill(~keep, float('-inf'))
 
-        gates = torch.softmax(logits, dim=0)
+        gates = torch.softmax(logits.float(), dim=0)
         gates = torch.nan_to_num(gates, nan=0.0, posinf=0.0, neginf=0.0)
         gate_sum = gates.sum(dim=0, keepdim=True).clamp_min(1e-6)
         gates = gates / gate_sum
-        return (stacked_y * gates.unsqueeze(-1).to(dtype=stacked_y.dtype)).sum(dim=0)
+
+        # Full-coverage routing: unlike top-k selection this never removes a
+        # complete source bank.  The floor is expressed as total uniform mass,
+        # so it remains well behaved as the number of long-context banks grows.
+        floor = max(0.0, min(1.0, float(router_floor)))
+        if floor > 0.0 and int(gates.shape[0]) > 1:
+            uniform = torch.full_like(gates, 1.0 / float(gates.shape[0]))
+            gates = gates * (1.0 - floor) + uniform * floor
+
+        mixed = (stacked_y * gates.unsqueeze(-1).to(dtype=stacked_y.dtype)).sum(dim=0)
+
+        # Mixing several independently normalised native-size attentions can
+        # shift residual magnitude even when every bank is individually in-
+        # distribution.  Match the mixed vector to the gate-weighted bank RMS,
+        # but only within a conservative ratio guard.  Direction/information is
+        # unchanged; this controls the length-dependent amplitude that tends to
+        # appear as saturation/contrast/noise drift in the DiT.
+        bank_rms = stacked_y.float().square().mean(dim=-1, keepdim=True).add(1e-8).sqrt()
+        target_rms = (bank_rms * gates.unsqueeze(-1)).sum(dim=0)
+        mixed_rms = mixed.float().square().mean(dim=-1, keepdim=True).add(1e-8).sqrt()
+        desired = target_rms / mixed_rms
+        lo = max(0.0, float(rms_min_ratio))
+        hi = max(lo, float(rms_max_ratio))
+        desired = desired.clamp(min=lo, max=hi)
+        return mixed * desired.to(dtype=mixed.dtype)
 
     def forward(
         self,
@@ -383,9 +413,12 @@ class _AdapterAttention(nn.Module):
                 rope=rope,
                 window_size=int(options.get('window_size', 384)),
                 overlap=int(options.get('overlap', 64)),
-                router_top_k=int(options.get('router_top_k', 2)),
+                router_top_k=int(options.get('router_top_k', 0)),
                 router_temperature=float(options.get('router_temperature', 0.8)),
                 locality_strength=float(options.get('locality_strength', 1.0)),
+                router_floor=float(options.get('router_floor', 0.02)),
+                rms_min_ratio=float(options.get('rms_min_ratio', 0.92)),
+                rms_max_ratio=float(options.get('rms_max_ratio', 1.08)),
             )
         else:
             k, v = self._project_key_value(context)
@@ -466,9 +499,14 @@ class _LLMAdapter(nn.Module):
         self.long_context_threshold = 512
         self.long_context_window_size = 384
         self.long_context_overlap = 64
-        self.long_context_router_top_k = 2
+        # v5 full-coverage default: 0 means all banks participate. This is the
+        # least destructive long-prompt mode because no source window is pruned.
+        self.long_context_router_top_k = 0
         self.long_context_router_temperature = 0.8
         self.long_context_locality_strength = 1.0
+        self.long_context_router_floor = 0.02
+        self.long_context_rms_min_ratio = 0.92
+        self.long_context_rms_max_ratio = 1.08
 
     def forward(
         self,
@@ -522,6 +560,9 @@ class _LLMAdapter(nn.Module):
             "router_top_k": int(self.long_context_router_top_k),
             "router_temperature": float(self.long_context_router_temperature),
             "locality_strength": float(self.long_context_locality_strength),
+            "router_floor": float(self.long_context_router_floor),
+            "rms_min_ratio": float(self.long_context_rms_min_ratio),
+            "rms_max_ratio": float(self.long_context_rms_max_ratio),
         }
 
         hidden_states = target_hidden_states

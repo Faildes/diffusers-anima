@@ -1073,12 +1073,17 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         router_top_k: int | None = None,
         router_temperature: float | None = None,
         locality_strength: float | None = None,
+        router_floor: float | None = None,
+        rms_min_ratio: float | None = None,
+        rms_max_ratio: float | None = None,
     ) -> "AnimaPipeline":
         """Configure v5 body-side long-source attention.
 
         ``windowed`` keeps the frozen Anima adapter inside its native <=512
         source-attention regime and routes each target query across overlapping
-        source banks. ``legacy`` restores the previous one-bank behaviour.
+        source banks. v5 defaults to full-coverage routing (``router_top_k=0``),
+        so every source bank contributes and no long-prompt window is discarded.
+        ``legacy`` restores the previous one-bank behaviour.
 
         This removes Anima's *input-source* 512-token cliff without changing the
         trained 512-slot target-conditioning contract seen by the DiT.
@@ -1114,6 +1119,20 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             if float(locality_strength) < 0.0:
                 raise ValueError("locality_strength must be >= 0")
             adapter.long_context_locality_strength = float(locality_strength)
+        if router_floor is not None:
+            if not 0.0 <= float(router_floor) <= 1.0:
+                raise ValueError("router_floor must be in [0, 1]")
+            adapter.long_context_router_floor = float(router_floor)
+        if rms_min_ratio is not None:
+            if float(rms_min_ratio) <= 0.0:
+                raise ValueError("rms_min_ratio must be > 0")
+            adapter.long_context_rms_min_ratio = float(rms_min_ratio)
+        if rms_max_ratio is not None:
+            if float(rms_max_ratio) <= 0.0:
+                raise ValueError("rms_max_ratio must be > 0")
+            adapter.long_context_rms_max_ratio = float(rms_max_ratio)
+        if float(adapter.long_context_rms_min_ratio) > float(adapter.long_context_rms_max_ratio):
+            raise ValueError("rms_min_ratio must be <= rms_max_ratio")
         return self
 
     def describe_adapter_long_context(self) -> dict[str, Any]:
@@ -1126,6 +1145,10 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             "router_top_k": int(adapter.long_context_router_top_k),
             "router_temperature": float(adapter.long_context_router_temperature),
             "locality_strength": float(adapter.long_context_locality_strength),
+            "router_floor": float(adapter.long_context_router_floor),
+            "rms_min_ratio": float(adapter.long_context_rms_min_ratio),
+            "rms_max_ratio": float(adapter.long_context_rms_max_ratio),
+            "full_source_coverage": int(adapter.long_context_router_top_k) == 0,
             "legacy_source_position_mode": str(adapter.source_position_mode),
             "target_conditioning_length": 512,
         }

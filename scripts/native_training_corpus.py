@@ -58,13 +58,17 @@ _MINIMAL_REPLACEMENTS: tuple[tuple[str, str, str], ...] = (
 # calibration file can grow arbitrarily large without allowing common solo /
 # colour-heavy prompt families to dominate the optimiser budget.
 _SAMPLING_BUCKET_WEIGHTS: dict[str, float] = {
-    "general": 0.30,
-    "composition": 0.15,
-    "binding": 0.20,
-    "count": 0.10,
+    "general": 0.20,
+    "composition": 0.12,
+    "binding": 0.22,
+    "count": 0.12,
     "multilingual": 0.10,
-    "color": 0.10,
-    "style": 0.05,
+    "color": 0.08,
+    "style": 0.04,
+    # v5 explicitly reserves fixed-budget optimiser pressure for prompt
+    # obedience instead of hoping it emerges from raw corpus frequency.
+    "instruction": 0.07,
+    "equivalence": 0.05,
 }
 
 _MULTI_SUBJECT_RE = re.compile(
@@ -123,6 +127,10 @@ def group_sampling_bucket(group: NativePromptGroup) -> str:
         return "count"
     if category == "multilingual_binding":
         return "multilingual"
+    if category in {"directive_contrast", "instruction_fidelity"}:
+        return "instruction"
+    if category == "tag_nl_equivalence":
+        return "equivalence"
     if category in {"color", "color_control"}:
         return "color"
     if category in {"spatial", "camera", "pose", "framing"}:
@@ -397,6 +405,88 @@ def build_binding_groups(*, count: int = 256, seed: int = 99173) -> list[NativeP
     return groups
 
 
+
+def build_instruction_fidelity_groups(*, count: int = 256, seed: int = 73321) -> list[NativePromptGroup]:
+    """Create hard prompt-obedience contrasts with minimal lexical change.
+
+    These pairs target the failure modes that matter for image prompting: exact
+    count, ownership, pose, spatial relation, camera direction and explicit
+    inclusion/exclusion.  They are generated independently of corpus size and
+    therefore do not increase the v3/v4 fixed optimiser-step budget.
+    """
+    rng = random.Random(int(seed))
+    colors = ["red", "blue", "green", "black", "white", "purple", "blonde"]
+    clothes = ["black dress", "white jacket", "green hoodie", "blue coat", "red uniform"]
+    poses = ["standing", "sitting", "kneeling", "walking", "looking at viewer"]
+    groups: list[NativePromptGroup] = []
+    for i in range(max(0, int(count))):
+        mode = i % 6
+        a, b = rng.sample(colors, 2)
+        c1, c2 = rng.sample(clothes, 2)
+        p1, p2 = rng.sample(poses, 2)
+        if mode == 0:
+            n = rng.randint(2, 7)
+            m = n + 1 if n < 8 else n - 1
+            left = f"exactly {n} girls, no additional people, group portrait, each face visible"
+            right = f"exactly {m} girls, no additional people, group portrait, each face visible"
+            focus = f"count_{n}_{m}"
+        elif mode == 1:
+            left = f"two girls; subject 1: left, {a} hair, {c1}; subject 2: right, {b} hair, {c2}"
+            right = f"two girls; subject 1: left, {a} hair, {c2}; subject 2: right, {b} hair, {c1}"
+            focus = "clothing_ownership"
+        elif mode == 2:
+            left = f"two girls; subject 1: left, {a} hair, {p1}; subject 2: right, {b} hair, {p2}"
+            right = f"two girls; subject 1: left, {a} hair, {p2}; subject 2: right, {b} hair, {p1}"
+            focus = "pose_ownership"
+        elif mode == 3:
+            left = f"{a}-haired girl left of {b}-haired girl, both full body"
+            right = f"{a}-haired girl right of {b}-haired girl, both full body"
+            focus = "spatial_direction"
+        elif mode == 4:
+            left = f"1girl, {a} hair, {c1}, low angle, full body"
+            right = f"1girl, {a} hair, {c1}, high angle, full body"
+            focus = "camera_direction"
+        else:
+            left = f"1girl, {a} hair, {c1}, wearing glasses, {p1}"
+            right = f"1girl, {a} hair, {c1}, no glasses, {p1}"
+            focus = "explicit_presence"
+        groups.append(NativePromptGroup((left, right), category="directive_contrast", focus=focus))
+    return groups
+
+
+def build_tag_nl_equivalence_groups(*, count: int = 160, seed: int = 73357) -> list[NativePromptGroup]:
+    """Pair Danbooru-like tags with natural-language prompts of identical intent."""
+    rng = random.Random(int(seed))
+    hairs = ["red", "blue", "black", "blonde", "white", "green"]
+    eyes = ["blue", "green", "brown", "amber", "purple"]
+    clothes = ["black dress", "white jacket", "green hoodie", "blue coat"]
+    scenes = ["classroom", "library", "city street", "forest", "train platform"]
+    poses = ["standing", "sitting", "walking", "kneeling"]
+    groups: list[NativePromptGroup] = []
+    for i in range(max(0, int(count))):
+        if i % 3 == 0:
+            hair, eye = rng.choice(hairs), rng.choice(eyes)
+            cloth, scene, pose = rng.choice(clothes), rng.choice(scenes), rng.choice(poses)
+            tag = f"1girl, solo, {hair} hair, {eye} eyes, {cloth}, {pose}, {scene}, full body"
+            natural = (
+                f"A single girl with {hair} hair and {eye} eyes is {pose} in a {scene}. "
+                f"She wears a {cloth}. Show her full body and no other person."
+            )
+        else:
+            h1, h2 = rng.sample(hairs, 2)
+            c1, c2 = rng.sample(clothes, 2)
+            tag = (
+                f"2girls; subject 1: left, {h1} hair, {c1}; "
+                f"subject 2: right, {h2} hair, {c2}; no other people"
+            )
+            natural = (
+                f"There are exactly two girls and nobody else. The girl on the left has {h1} hair "
+                f"and wears a {c1}. The girl on the right has {h2} hair and wears a {c2}."
+            )
+        groups.append(NativePromptGroup((tag, natural), category="tag_nl_equivalence", focus="same_visual_intent"))
+    return groups
+
+
 def build_training_groups(
     lines: Sequence[str],
     *,
@@ -427,7 +517,13 @@ def build_training_groups(
     ]
     bindings = build_binding_groups(count=binding_pairs, seed=seed + 17)
     color_controls = build_color_control_groups(count=max(64, min(256, binding_pairs // 4)), seed=seed + 29)
-    groups = base_groups + paired + bindings + color_controls
+    instruction_groups = build_instruction_fidelity_groups(
+        count=max(192, int(binding_pairs)), seed=seed + 41
+    )
+    equivalence_groups = build_tag_nl_equivalence_groups(
+        count=max(128, int(binding_pairs) // 2), seed=seed + 53
+    )
+    groups = base_groups + paired + bindings + color_controls + instruction_groups + equivalence_groups
     rng.shuffle(groups)
     return groups
 
@@ -453,6 +549,8 @@ __all__ = [
     "ANIMA_COMPAT_ANCHOR_PROMPTS",
     "build_binding_groups",
     "build_color_control_groups",
+    "build_instruction_fidelity_groups",
+    "build_tag_nl_equivalence_groups",
     "build_training_groups",
     "default_sampling_bucket_weights",
     "group_sampling_bucket",

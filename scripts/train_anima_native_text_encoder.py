@@ -143,6 +143,12 @@ class NativeEncoderTrainingConfig:
     subject_slot_anchor_weight: float = 0.40
     ownership_anchor_weight: float = 0.30
     multi_person_reference_boost: float = 0.50
+    # v5 prompt-obedience objectives. These explicitly preserve instruction
+    # contrasts while collapsing tag/natural-language paraphrases that describe
+    # the same requested image.
+    instruction_fidelity_weight: float = 0.55
+    tag_nl_equivalence_weight: float = 0.35
+    instruction_margin_floor: float = 0.05
     layer_prior_weight: float = 0.01
     bootstrap_token_weight: float = 0.50
     bootstrap_final_fraction: float = 0.25
@@ -817,6 +823,42 @@ def _ownership_anchor_loss(
     return torch.stack(losses).mean() if losses else student_pool.new_zeros(())
 
 
+def _instruction_fidelity_loss(
+    student_pool: torch.Tensor,
+    source_pool: torch.Tensor,
+    pairs: Sequence[tuple[int, int, str]],
+    *,
+    margin_floor: float,
+) -> torch.Tensor:
+    """Keep visually different directives separated after native alignment."""
+    losses: list[torch.Tensor] = []
+    for a, b, category in pairs:
+        if category not in {"directive_contrast", "instruction_fidelity"}:
+            continue
+        ds = _cosine_distance(source_pool[a:a+1], source_pool[b:b+1]).squeeze(0).detach()
+        dstudent = _cosine_distance(student_pool[a:a+1], student_pool[b:b+1]).squeeze(0)
+        margin = torch.clamp(ds * 0.90, min=max(0.0, float(margin_floor)), max=0.30)
+        losses.append(torch.relu(margin - dstudent))
+    return torch.stack(losses).mean() if losses else student_pool.new_zeros(())
+
+
+def _tag_nl_equivalence_loss(
+    student_pool: torch.Tensor,
+    source_pool: torch.Tensor,
+    pairs: Sequence[tuple[int, int, str]],
+) -> torch.Tensor:
+    """Make tag and natural-language renderings of one intent converge."""
+    losses: list[torch.Tensor] = []
+    for a, b, category in pairs:
+        if category != "tag_nl_equivalence":
+            continue
+        ds = _cosine_distance(source_pool[a:a+1], source_pool[b:b+1]).squeeze(0).detach()
+        dstudent = _cosine_distance(student_pool[a:a+1], student_pool[b:b+1]).squeeze(0)
+        target = torch.minimum(ds * 0.60, ds.new_tensor(0.08))
+        losses.append(F.smooth_l1_loss(dstudent, target))
+    return torch.stack(losses).mean() if losses else student_pool.new_zeros(())
+
+
 def _channel_distribution_loss(
     student: torch.Tensor,
     student_mask: torch.Tensor,
@@ -1068,7 +1110,7 @@ def _save_native_encoder(
         "training_steps": str(int(steps)),
         "training_final_loss": f"{float(final_loss):.8g}",
         "training_last_n_layers": str(int(config.train_last_n_layers)),
-        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v4_partial_qwen06_multi_person_anchor",
+        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience",
         "knowledge_policy": "preserve_qwen35_vocab_knowledge_multilingual_geometry_qwen3_is_compat_anchor",
         "training_budget_mode": "fixed_optimizer_steps",
         "training_fixed_budget_steps": str(int(config.fixed_budget_steps)),
@@ -1078,6 +1120,9 @@ def _save_native_encoder(
         "training_count_anchor_weight": f"{float(config.count_anchor_weight):.8g}",
         "training_subject_slot_anchor_weight": f"{float(config.subject_slot_anchor_weight):.8g}",
         "training_ownership_anchor_weight": f"{float(config.ownership_anchor_weight):.8g}",
+        "training_instruction_fidelity_weight": f"{float(config.instruction_fidelity_weight):.8g}",
+        "training_tag_nl_equivalence_weight": f"{float(config.tag_nl_equivalence_weight):.8g}",
+        "training_instruction_margin_floor": f"{float(config.instruction_margin_floor):.8g}",
         "training_best_step": str(int(best_step)),
         "training_early_stopped": "true" if early_stopped else "false",
         "validation_prompts": str(int(validation_prompts)),
@@ -1459,10 +1504,20 @@ def train_anima_native_text_encoder(
                     # This is especially important for vocabulary, multilingual
                     # distinctions, count and attribute-ownership hard negatives.
                     gain = ds.detach().new_ones(())
-                hard_multiplier = 1.35 if category in {"attribute_swap", "count_binding", "multilingual_binding"} else 1.0
-                knowledge_losses.append(
-                    float(hard_multiplier) * gain * F.smooth_l1_loss(dstudent, ds.detach())
-                )
+                if category in {"directive_contrast", "instruction_fidelity"}:
+                    hard_multiplier = 1.75
+                elif category in {"attribute_swap", "count_binding", "multilingual_binding"}:
+                    hard_multiplier = 1.35
+                elif category == "tag_nl_equivalence":
+                    # Equivalence is handled by a dedicated attraction loss; do
+                    # not preserve syntax distance through the contrastive term.
+                    hard_multiplier = 0.0
+                else:
+                    hard_multiplier = 1.0
+                if hard_multiplier > 0.0:
+                    knowledge_losses.append(
+                        float(hard_multiplier) * gain * F.smooth_l1_loss(dstudent, ds.detach())
+                    )
                 gains.append(gain)
 
             reference_scale = (1.0 / active_reference_fraction) if ref_pool is not None else 0.0
@@ -1501,6 +1556,13 @@ def train_anima_native_text_encoder(
                     ref_group_ids.to(device) if ref_group_ids is not None else None,
                 )
                 ownership_anchor = reference_scale * _ownership_anchor_loss(student_pool, ref_pool, pairs)
+            instruction_fidelity = _instruction_fidelity_loss(
+                student_pool,
+                source_pool,
+                pairs,
+                margin_floor=float(cfg.instruction_margin_floor),
+            )
+            tag_nl_equivalence = _tag_nl_equivalence_loss(student_pool, source_pool, pairs)
             knowledge_gain = (
                 torch.stack(knowledge_losses).mean() if knowledge_losses else student_pool.new_zeros(())
             )
@@ -1561,6 +1623,8 @@ def train_anima_native_text_encoder(
                 + float(cfg.count_anchor_weight) * count_anchor
                 + float(cfg.subject_slot_anchor_weight) * slot_anchor
                 + float(cfg.ownership_anchor_weight) * ownership_anchor
+                + float(cfg.instruction_fidelity_weight) * instruction_fidelity
+                + float(cfg.tag_nl_equivalence_weight) * tag_nl_equivalence
                 + float(cfg.distribution_weight) * distribution
                 + float(cfg.channel_distribution_weight) * channel_distribution
                 + float(cfg.layer_prior_weight) * layer_prior
@@ -1581,6 +1645,8 @@ def train_anima_native_text_encoder(
                 "count_anchor": float(count_anchor.detach().item()),
                 "slot_anchor": float(slot_anchor.detach().item()),
                 "ownership_anchor": float(ownership_anchor.detach().item()),
+                "instruction": float(instruction_fidelity.detach().item()),
+                "tag_nl_eq": float(tag_nl_equivalence.detach().item()),
                 "distribution": float(distribution.detach().item()),
                 "channel_dist": float(channel_distribution.detach().item()),
                 "bootstrap": float(bootstrap_loss.detach().item()),
@@ -1639,6 +1705,8 @@ def train_anima_native_text_encoder(
                         count_anchor=f"{avg_values.get('count_anchor', values['count_anchor']):.6f}",
                         slot_anchor=f"{avg_values.get('slot_anchor', values['slot_anchor']):.6f}",
                         ownership_anchor=f"{avg_values.get('ownership_anchor', values['ownership_anchor']):.6f}",
+                        instruction=f"{avg_values.get('instruction', values['instruction']):.6f}",
+                        tag_nl_eq=f"{avg_values.get('tag_nl_eq', values['tag_nl_eq']):.6f}",
                         reference=f"{avg_values.get('reference', values['reference']):.3f}",
                         bootstrap=f"{avg_values.get('bootstrap', values['bootstrap']):.6f}",
                     )
@@ -1828,6 +1896,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--subject-slot-anchor-weight", type=float, default=0.40)
     p.add_argument("--ownership-anchor-weight", type=float, default=0.30)
     p.add_argument("--multi-person-reference-boost", type=float, default=0.50)
+    p.add_argument("--instruction-fidelity-weight", type=float, default=0.55)
+    p.add_argument("--tag-nl-equivalence-weight", type=float, default=0.35)
+    p.add_argument("--instruction-margin-floor", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=3571)
     p.add_argument("--log-every", type=int, default=10)
     return p
@@ -1876,6 +1947,9 @@ def main() -> None:
         subject_slot_anchor_weight=a.subject_slot_anchor_weight,
         ownership_anchor_weight=a.ownership_anchor_weight,
         multi_person_reference_boost=a.multi_person_reference_boost,
+        instruction_fidelity_weight=a.instruction_fidelity_weight,
+        tag_nl_equivalence_weight=a.tag_nl_equivalence_weight,
+        instruction_margin_floor=a.instruction_margin_floor,
         seed=a.seed,
         log_every=a.log_every,
     )

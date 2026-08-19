@@ -103,7 +103,7 @@ def test_v3_training_is_fixed_budget_balanced_and_best_validation_driven():
         '_evaluate_validation',
         '_snapshot_trainable_state',
         '_restore_trainable_state',
-        'qwen35_fixed_budget_balanced_best_validation_v3',
+        'qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience',
         'training_best_step',
         'validation_neutral_channel',
     ):
@@ -134,3 +134,40 @@ def test_v3_corpus_validation_size_is_not_a_fraction_of_corpus_and_color_control
     joined = "\n".join(text for group in controls for text in group.texts)
     assert "high saturation" in joined
     assert "controlled saturation" in joined
+
+
+def test_v5_long_context_keeps_all_windows_and_guards_rms():
+    source = (ROOT / "src/diffusers_anima/models/transformers/modeling_anima_transformer.py").read_text(encoding="utf-8")
+    for marker in (
+        "long_context_router_top_k = 0",
+        "long_context_router_floor = 0.02",
+        "long_context_rms_min_ratio = 0.92",
+        "long_context_rms_max_ratio = 1.08",
+        "Full-coverage routing",
+    ):
+        assert marker in source
+    ast.parse(source)
+
+
+def test_v5_training_adds_instruction_and_tag_nl_objectives():
+    trainer = (ROOT / "scripts/train_anima_native_text_encoder.py").read_text(encoding="utf-8")
+    corpus_path = ROOT / "scripts/native_training_corpus.py"
+    corpus_source = corpus_path.read_text(encoding="utf-8")
+    for marker in (
+        "instruction_fidelity_weight",
+        "tag_nl_equivalence_weight",
+        "_instruction_fidelity_loss",
+        "_tag_nl_equivalence_loss",
+        "qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience",
+    ):
+        assert marker in trainer
+    for marker in ("build_instruction_fidelity_groups", "build_tag_nl_equivalence_groups"):
+        assert marker in corpus_source
+    spec = importlib.util.spec_from_file_location("native_training_corpus_v5_test", corpus_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    assert len(module.build_instruction_fidelity_groups(count=12, seed=1)) == 12
+    assert len(module.build_tag_nl_equivalence_groups(count=9, seed=1)) == 9
+    assert abs(sum(module.default_sampling_bucket_weights().values()) - 1.0) < 1e-6
