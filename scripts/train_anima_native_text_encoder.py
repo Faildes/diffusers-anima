@@ -122,6 +122,10 @@ class NativeEncoderTrainingConfig:
     # Running it on a deterministic subset keeps that anchor while avoiding a
     # second LLM forward on every microbatch.
     reference_batch_fraction: float = 0.50
+    # Multi-person / exact-count prompts benefit disproportionately from the
+    # stable Anima behaviour of Qwen3-0.6B. Use the 0.6B anchor more often for
+    # those prompts without letting it dominate normal single-subject prompts.
+    multi_person_reference_fraction: float = 1.00
     reference_max_length: int = 256
     fused_adamw: bool = True
     allow_tf32: bool = True
@@ -134,6 +138,11 @@ class NativeEncoderTrainingConfig:
     distribution_weight: float = 0.20
     channel_distribution_weight: float = 0.06
     binding_geometry_weight: float = 0.35
+    multi_person_compat_weight: float = 0.40
+    count_anchor_weight: float = 0.45
+    subject_slot_anchor_weight: float = 0.40
+    ownership_anchor_weight: float = 0.30
+    multi_person_reference_boost: float = 0.50
     layer_prior_weight: float = 0.01
     bootstrap_token_weight: float = 0.50
     bootstrap_final_fraction: float = 0.25
@@ -605,7 +614,7 @@ _SUBJECT_MARKER_RE = re.compile(
     r"(?i)(?:^|[;|\n])\s*(?:subject|character|char|person|woman|man|girl|boy)\s*(?:#?\d+|[A-H])\s*:"
 )
 _EXACT_COUNT_RE = re.compile(
-    r"(?i)\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:characters?|people|persons?|girls?|boys?|women|men)\b"
+    r"(?i)(?:\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:characters?|people|persons?|girls?|boys?|women|men)\b|\b(?:duo|pair|couple)\b|\btrio\b|\bquartet\b|\bquintet\b|\bsextet\b|(?<!\d)(\d{1,2})\s*(?:girls?|boys?|women|men)(?!\w))"
 )
 _COUNT_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
@@ -662,8 +671,20 @@ def _infer_training_subject_controls(
         if count <= 0:
             m = _EXACT_COUNT_RE.search(text)
             if m is not None:
-                raw = m.group(1).lower()
-                count = int(raw) if raw.isdigit() else int(_COUNT_WORDS.get(raw, 0))
+                raw = (m.group(1) or m.group(2) or "").lower()
+                token = m.group(0).lower()
+                if raw:
+                    count = int(raw) if raw.isdigit() else int(_COUNT_WORDS.get(raw, 0))
+                elif "duo" in token or "pair" in token or "couple" in token:
+                    count = 2
+                elif "trio" in token:
+                    count = 3
+                elif "quartet" in token:
+                    count = 4
+                elif "quintet" in token:
+                    count = 5
+                elif "sextet" in token:
+                    count = 6
         if count > 0:
             counts[b] = min(int(count), int(max_subject_slots))
         if not matches:
@@ -722,6 +743,80 @@ def _group_binding_geometry_loss(
     return torch.stack(losses).mean() if losses else student.new_zeros(())
 
 
+def _slot_centroid_anchor_loss(
+    student: torch.Tensor,
+    target: torch.Tensor,
+    student_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    student_group_ids: torch.Tensor | None,
+    target_group_ids: torch.Tensor | None,
+) -> torch.Tensor:
+    if student_group_ids is None or target_group_ids is None:
+        return student.new_zeros(())
+    losses: list[torch.Tensor] = []
+    for b in range(student.shape[0]):
+        sg = student_group_ids[b]
+        tg = target_group_ids[b]
+        svalid = student_mask[b].bool()
+        tvalid = target_mask[b].bool()
+        s_gids = {int(x) for x in torch.unique(sg[svalid]).tolist() if int(x) > 0}
+        t_gids = {int(x) for x in torch.unique(tg[tvalid]).tolist() if int(x) > 0}
+        gids = sorted(s_gids & t_gids)
+        if not gids:
+            continue
+        per_prompt: list[torch.Tensor] = []
+        for gid in gids:
+            sidx = svalid & (sg == gid)
+            tidx = tvalid & (tg == gid)
+            if not bool(sidx.any()) or not bool(tidx.any()):
+                continue
+            sc = student[b, sidx].mean(dim=0)
+            tc = target[b, tidx].detach().mean(dim=0).to(device=student.device, dtype=student.dtype)
+            per_prompt.append(_cosine_distance(sc.unsqueeze(0), tc.unsqueeze(0)).mean())
+            per_prompt.append(0.25 * _normalized_mse(sc, tc))
+        if per_prompt:
+            losses.append(torch.stack(per_prompt).mean())
+    return torch.stack(losses).mean() if losses else student.new_zeros(())
+
+
+def _multi_person_mask(subject_counts: torch.Tensor | None) -> torch.Tensor | None:
+    if subject_counts is None:
+        return None
+    return subject_counts.reshape(-1).to(dtype=torch.long) >= 2
+
+
+def _count_anchor_loss(
+    student_pool: torch.Tensor,
+    target_pool: torch.Tensor | None,
+    subject_counts: torch.Tensor | None,
+) -> torch.Tensor:
+    if target_pool is None:
+        return student_pool.new_zeros(())
+    multi_mask = _multi_person_mask(subject_counts)
+    if multi_mask is None or int(multi_mask.sum().item()) <= 0:
+        return student_pool.new_zeros(())
+    sp = student_pool[multi_mask]
+    tp = target_pool[multi_mask].detach().to(device=student_pool.device, dtype=student_pool.dtype)
+    return _cosine_distance(sp, tp).mean() + 0.25 * _normalized_mse(sp, tp)
+
+
+def _ownership_anchor_loss(
+    student_pool: torch.Tensor,
+    target_pool: torch.Tensor | None,
+    pairs: Sequence[tuple[int, int, str]],
+) -> torch.Tensor:
+    if target_pool is None:
+        return student_pool.new_zeros(())
+    losses: list[torch.Tensor] = []
+    for a, b, category in pairs:
+        if category not in {"binding", "attribute_swap", "count_binding"}:
+            continue
+        ds = _cosine_distance(student_pool[a:a+1], student_pool[b:b+1]).squeeze(0)
+        dt = _cosine_distance(target_pool[a:a+1], target_pool[b:b+1]).squeeze(0).detach().to(device=student_pool.device, dtype=student_pool.dtype)
+        losses.append(F.smooth_l1_loss(ds, dt))
+    return torch.stack(losses).mean() if losses else student_pool.new_zeros(())
+
+
 def _channel_distribution_loss(
     student: torch.Tensor,
     student_mask: torch.Tensor,
@@ -762,7 +857,7 @@ def _validation_prompt_flags(prompts: Sequence[str]) -> tuple[torch.Tensor, torc
         r"(?i)\b(?:high saturation|controlled saturation|low saturation|pastel palette|muted earth tones|monochrome|black and white|warm palette|cool palette|neon lighting|colored bounce light)\b"
     )
     binding = re.compile(
-        r"(?i)(?:subject\s*(?:#?\d+|[A-H])\s*:|two women|two men|woman and man|duo|trio|group portrait|exactly\s+(?:two|three|four|five|six|\d+)\s+characters)"
+        r"(?i)(?:subject\s*(?:#?\d+|[A-H])\s*:|two women|two men|woman and man|duo|trio|quartet|group portrait|(?:[2-9]\d?\s*(?:girls?|boys?|women|men|people|characters?))|exactly\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:characters?|people|girls?|boys?|women|men))"
     )
     neutral = torch.tensor([not bool(explicit_color.search(text)) for text in prompts], dtype=torch.bool)
     binding_mask = torch.tensor([bool(binding.search(text)) for text in prompts], dtype=torch.bool)
@@ -973,11 +1068,16 @@ def _save_native_encoder(
         "training_steps": str(int(steps)),
         "training_final_loss": f"{float(final_loss):.8g}",
         "training_last_n_layers": str(int(config.train_last_n_layers)),
-        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v3",
+        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v4_partial_qwen06_multi_person_anchor",
         "knowledge_policy": "preserve_qwen35_vocab_knowledge_multilingual_geometry_qwen3_is_compat_anchor",
         "training_budget_mode": "fixed_optimizer_steps",
         "training_fixed_budget_steps": str(int(config.fixed_budget_steps)),
         "training_balanced_sampling": "true" if config.balanced_sampling else "false",
+        "training_multi_person_reference_fraction": f"{float(config.multi_person_reference_fraction):.8g}",
+        "training_multi_person_compat_weight": f"{float(config.multi_person_compat_weight):.8g}",
+        "training_count_anchor_weight": f"{float(config.count_anchor_weight):.8g}",
+        "training_subject_slot_anchor_weight": f"{float(config.subject_slot_anchor_weight):.8g}",
+        "training_ownership_anchor_weight": f"{float(config.ownership_anchor_weight):.8g}",
         "training_best_step": str(int(best_step)),
         "training_early_stopped": "true" if early_stopped else "false",
         "validation_prompts": str(int(validation_prompts)),
@@ -1210,6 +1310,7 @@ def train_anima_native_text_encoder(
         balanced_sampling=bool(cfg.balanced_sampling),
         gradient_accumulation=int(cfg.gradient_accumulation_steps),
         reference_batch_fraction=f"{float(cfg.reference_batch_fraction):.3f}",
+        multi_person_reference_fraction=f"{float(cfg.multi_person_reference_fraction):.3f}",
         reference_max_length=int(cfg.reference_max_length),
         fused_adamw=bool(adamw_kwargs.get("fused", False)),
         warmup_steps=warmup,
@@ -1279,7 +1380,11 @@ def train_anima_native_text_encoder(
             # language-model forward on every microbatch while inverse-
             # probability scaling keeps its expected loss contribution stable.
             reference_fraction = max(0.05, min(1.0, float(cfg.reference_batch_fraction)))
-            use_reference = micro_step_global == 1 or rng.random() < reference_fraction
+            multi_person_fraction = max(reference_fraction, min(1.0, float(cfg.multi_person_reference_fraction)))
+            batch_bucket = {group_sampling_bucket(group) for group in group_batch}
+            batch_has_multi_person = bool(batch_bucket & {"binding", "count", "multilingual"})
+            active_reference_fraction = multi_person_fraction if batch_has_multi_person else reference_fraction
+            use_reference = micro_step_global == 1 or rng.random() < active_reference_fraction
             ref: dict[str, torch.Tensor] | None = None
             ref_hidden: torch.Tensor | None = None
             ref_pool: torch.Tensor | None = None
@@ -1309,6 +1414,7 @@ def train_anima_native_text_encoder(
                     texts,
                     device=ref_device,
                     max_length=min(int(cfg.max_length), max(32, int(cfg.reference_max_length))),
+                    include_offsets=need_offsets,
                 )
                 with torch.inference_mode():
                     ref_out = reference(
@@ -1320,12 +1426,23 @@ def train_anima_native_text_encoder(
 
             student_pool = _masked_pool(native_hidden, src["attention_mask"])
             source_pool = _masked_pool(source_hidden.detach(), src["attention_mask"])
+            ref_group_ids: torch.Tensor | None = None
             if ref_hidden is not None and ref is not None:
                 ref_pool = _masked_pool(ref_hidden, ref["attention_mask"]).to(
                     device=device, dtype=student_pool.dtype
                 )
+                ref_group_ids, _ = _infer_training_subject_controls(
+                    texts,
+                    ref.get("offset_mapping"),
+                    ref["attention_mask"],
+                    device=ref_device,
+                    max_subject_slots=int(student.native_head.native_config.max_subject_slots),
+                )
 
             sample_weights = torch.ones(student_pool.shape[0], device=device, dtype=torch.float32)
+            multi_mask = _multi_person_mask(subject_counts)
+            if multi_mask is not None and bool(multi_mask.any()):
+                sample_weights = sample_weights + multi_mask.to(dtype=sample_weights.dtype) * float(cfg.multi_person_reference_boost)
             knowledge_losses: list[torch.Tensor] = []
             gains: list[torch.Tensor] = []
             for a, b, category in pairs:
@@ -1348,7 +1465,7 @@ def train_anima_native_text_encoder(
                 )
                 gains.append(gain)
 
-            reference_scale = (1.0 / reference_fraction) if ref_pool is not None else 0.0
+            reference_scale = (1.0 / active_reference_fraction) if ref_pool is not None else 0.0
             if ref_pool is not None:
                 compat_each = _cosine_distance(student_pool, ref_pool)
                 compat_each = compat_each + 0.25 * _normalized_mse_each(student_pool, ref_pool)
@@ -1366,6 +1483,24 @@ def train_anima_native_text_encoder(
                 src["attention_mask"],
                 group_ids,
             )
+            multi_person_compat = student_pool.new_zeros(())
+            count_anchor = student_pool.new_zeros(())
+            slot_anchor = student_pool.new_zeros(())
+            ownership_anchor = student_pool.new_zeros(())
+            if ref_hidden is not None and ref is not None and ref_pool is not None:
+                ref_hidden_device = ref_hidden.to(device=device, dtype=native_hidden.dtype)
+                ref_mask = ref["attention_mask"].to(device)
+                multi_person_compat = reference_scale * _count_anchor_loss(student_pool, ref_pool, subject_counts)
+                count_anchor = reference_scale * _count_anchor_loss(student_pool, ref_pool, subject_counts)
+                slot_anchor = reference_scale * _slot_centroid_anchor_loss(
+                    native_hidden,
+                    ref_hidden_device,
+                    src["attention_mask"],
+                    ref_mask,
+                    group_ids,
+                    ref_group_ids.to(device) if ref_group_ids is not None else None,
+                )
+                ownership_anchor = reference_scale * _ownership_anchor_loss(student_pool, ref_pool, pairs)
             knowledge_gain = (
                 torch.stack(knowledge_losses).mean() if knowledge_losses else student_pool.new_zeros(())
             )
@@ -1422,6 +1557,10 @@ def train_anima_native_text_encoder(
                 + float(cfg.token_geometry_weight) * token_geometry
                 + float(cfg.knowledge_gain_weight) * knowledge_gain
                 + float(cfg.binding_geometry_weight) * binding_geometry
+                + float(cfg.multi_person_compat_weight) * multi_person_compat
+                + float(cfg.count_anchor_weight) * count_anchor
+                + float(cfg.subject_slot_anchor_weight) * slot_anchor
+                + float(cfg.ownership_anchor_weight) * ownership_anchor
                 + float(cfg.distribution_weight) * distribution
                 + float(cfg.channel_distribution_weight) * channel_distribution
                 + float(cfg.layer_prior_weight) * layer_prior
@@ -1438,6 +1577,10 @@ def train_anima_native_text_encoder(
                 "token_geom": float(token_geometry.detach().item()),
                 "knowledge": float(knowledge_gain.detach().item()),
                 "binding": float(binding_geometry.detach().item()),
+                "multi_compat": float(multi_person_compat.detach().item()),
+                "count_anchor": float(count_anchor.detach().item()),
+                "slot_anchor": float(slot_anchor.detach().item()),
+                "ownership_anchor": float(ownership_anchor.detach().item()),
                 "distribution": float(distribution.detach().item()),
                 "channel_dist": float(channel_distribution.detach().item()),
                 "bootstrap": float(bootstrap_loss.detach().item()),
@@ -1492,6 +1635,10 @@ def train_anima_native_text_encoder(
                         knowledge=f"{avg_values.get('knowledge', values['knowledge']):.6f}",
                         distribution=f"{avg_values.get('distribution', values['distribution']):.6f}",
                         binding=f"{avg_values.get('binding', values['binding']):.6f}",
+                        multi_compat=f"{avg_values.get('multi_compat', values['multi_compat']):.6f}",
+                        count_anchor=f"{avg_values.get('count_anchor', values['count_anchor']):.6f}",
+                        slot_anchor=f"{avg_values.get('slot_anchor', values['slot_anchor']):.6f}",
+                        ownership_anchor=f"{avg_values.get('ownership_anchor', values['ownership_anchor']):.6f}",
                         reference=f"{avg_values.get('reference', values['reference']):.3f}",
                         bootstrap=f"{avg_values.get('bootstrap', values['bootstrap']):.6f}",
                     )
@@ -1674,7 +1821,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-fraction", type=float, default=0.35)
     p.add_argument("--binding-pairs", type=int, default=256)
     p.add_argument("--reference-batch-fraction", type=float, default=0.50)
+    p.add_argument("--multi-person-reference-fraction", type=float, default=1.00)
     p.add_argument("--reference-max-length", type=int, default=256)
+    p.add_argument("--multi-person-compat-weight", type=float, default=0.40)
+    p.add_argument("--count-anchor-weight", type=float, default=0.45)
+    p.add_argument("--subject-slot-anchor-weight", type=float, default=0.40)
+    p.add_argument("--ownership-anchor-weight", type=float, default=0.30)
+    p.add_argument("--multi-person-reference-boost", type=float, default=0.50)
     p.add_argument("--seed", type=int, default=3571)
     p.add_argument("--log-every", type=int, default=10)
     return p
@@ -1716,7 +1869,13 @@ def main() -> None:
         pair_fraction=a.pair_fraction,
         binding_pairs=a.binding_pairs,
         reference_batch_fraction=a.reference_batch_fraction,
+        multi_person_reference_fraction=a.multi_person_reference_fraction,
         reference_max_length=a.reference_max_length,
+        multi_person_compat_weight=a.multi_person_compat_weight,
+        count_anchor_weight=a.count_anchor_weight,
+        subject_slot_anchor_weight=a.subject_slot_anchor_weight,
+        ownership_anchor_weight=a.ownership_anchor_weight,
+        multi_person_reference_boost=a.multi_person_reference_boost,
         seed=a.seed,
         log_every=a.log_every,
     )
