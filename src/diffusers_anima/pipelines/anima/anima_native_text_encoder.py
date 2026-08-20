@@ -94,6 +94,7 @@ class AnimaNativeHeadConfig:
     norm_eps: float = 1e-6
     final_layer_logit_bias: float = 3.0
     max_subject_slots: int = 16
+    max_separator_types: int = 3
     binding_rms_min_ratio: float = 0.92
     binding_rms_max_ratio: float = 1.08
 
@@ -120,6 +121,7 @@ class AnimaNativeHeadConfig:
             norm_eps=_float("native_norm_eps", 1e-6),
             final_layer_logit_bias=_float("native_final_layer_logit_bias", 3.0),
             max_subject_slots=max(2, _int("native_max_subject_slots", 16)),
+            max_separator_types=max(3, _int("native_max_separator_types", 3)),
             binding_rms_min_ratio=_float("native_binding_rms_min_ratio", 0.92),
             binding_rms_max_ratio=_float("native_binding_rms_max_ratio", 1.08),
         )
@@ -181,6 +183,15 @@ class AnimaNativeQwen35Head(nn.Module):
         self.count_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
         self.binding_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
 
+        # Separator provenance is distinct from subject identity. A weak
+        # boundary residual lets AND/BREAK/semicolon survive the bridge-free
+        # path without turning style/background clauses into character slots.
+        self.separator_embedding = nn.Embedding(int(config.max_separator_types) + 1, dim, padding_idx=0)
+        nn.init.normal_(self.separator_embedding.weight, mean=0.0, std=0.005)
+        with torch.no_grad():
+            self.separator_embedding.weight[0].zero_()
+        self.separator_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+
     @property
     def layer_indices(self) -> tuple[int, ...]:
         return tuple(self.native_config.layer_indices)
@@ -221,6 +232,7 @@ class AnimaNativeQwen35Head(nn.Module):
         attention_mask: torch.Tensor | None,
         group_ids: torch.Tensor | None,
         subject_counts: torch.Tensor | None,
+        separator_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Inject slot/count ownership without shifting Anima activation scale.
 
@@ -229,9 +241,11 @@ class AnimaNativeQwen35Head(nn.Module):
         guard so stronger identity binding cannot become a global saturation or
         contrast shift in the image model.
         """
-        if group_ids is None and subject_counts is None:
+        if group_ids is None and subject_counts is None and separator_ids is None:
             zero = hidden.new_zeros(())
-            return hidden, {"slot_gate": zero, "count_gate": zero, "binding_gate": zero}
+            return hidden, {
+                "slot_gate": zero, "count_gate": zero, "binding_gate": zero, "separator_gate": zero
+            }
 
         base = hidden
         out = hidden
@@ -246,6 +260,17 @@ class AnimaNativeQwen35Head(nn.Module):
         slot_strength = torch.tanh(self.slot_gate).to(dtype=hidden.dtype)
         count_strength = torch.tanh(self.count_gate).to(dtype=hidden.dtype)
         binding_strength = torch.tanh(self.binding_gate).to(dtype=hidden.dtype)
+        separator_strength = torch.tanh(self.separator_gate).to(dtype=hidden.dtype)
+
+        if separator_ids is not None:
+            separators = separator_ids.to(device=hidden.device, dtype=torch.long)
+            if separators.shape[1] < seq_len:
+                separators = F.pad(separators, (0, seq_len - separators.shape[1]), value=0)
+            elif separators.shape[1] > seq_len:
+                separators = separators[:, :seq_len]
+            separators = separators.clamp_(0, self.separator_embedding.num_embeddings - 1)
+            boundary = self.separator_embedding(separators).to(dtype=hidden.dtype)
+            out = out + separator_strength * boundary * mask.unsqueeze(-1).to(hidden.dtype)
 
         if group_ids is not None:
             groups = group_ids.to(device=hidden.device, dtype=torch.long)
@@ -302,6 +327,7 @@ class AnimaNativeQwen35Head(nn.Module):
             "slot_gate": slot_strength.float(),
             "count_gate": count_strength.float(),
             "binding_gate": binding_strength.float(),
+            "separator_gate": separator_strength.float(),
         }
 
     def _select_layers(self, hidden_states: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -323,6 +349,7 @@ class AnimaNativeQwen35Head(nn.Module):
         attention_mask: torch.Tensor | None = None,
         group_ids: torch.Tensor | None = None,
         subject_counts: torch.Tensor | None = None,
+        separator_ids: torch.Tensor | None = None,
         return_details: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         selected = self._select_layers(hidden_states)
@@ -349,6 +376,7 @@ class AnimaNativeQwen35Head(nn.Module):
             attention_mask=attention_mask,
             group_ids=group_ids,
             subject_counts=subject_counts,
+            separator_ids=separator_ids,
         )
 
         if not return_details:
@@ -481,6 +509,7 @@ class AnimaNativeQwen35Encoder(nn.Module):
         return_native_details: bool = False,
         anima_group_ids: torch.Tensor | None = None,
         anima_subject_counts: torch.Tensor | None = None,
+        anima_separator_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ):
         # The native head always requires the backbone hidden-state stack.  Cache
@@ -498,6 +527,7 @@ class AnimaNativeQwen35Encoder(nn.Module):
             attention_mask=attention_mask,
             group_ids=anima_group_ids,
             subject_counts=anima_subject_counts,
+            separator_ids=anima_separator_ids,
             return_details=bool(return_native_details),
         )
         if return_native_details:
@@ -528,7 +558,7 @@ class AnimaNativeQwen35Encoder(nn.Module):
             "intermediate_size": int(self.native_head.native_config.intermediate_size),
             "layer_indices": list(self.native_head.layer_indices),
             "max_subject_slots": int(self.native_head.native_config.max_subject_slots),
-            "binding_head": "slot_count_group_v2",
+            "binding_head": "slot_count_group_separator_v3",
             "bridge_required": False,
         }
 
@@ -541,9 +571,10 @@ def native_head_metadata(config: AnimaNativeHeadConfig) -> dict[str, str]:
         "native_norm_eps": f"{float(config.norm_eps):.8g}",
         "native_final_layer_logit_bias": f"{float(config.final_layer_logit_bias):.8g}",
         "native_max_subject_slots": str(int(config.max_subject_slots)),
+        "native_max_separator_types": str(int(config.max_separator_types)),
         "native_binding_rms_min_ratio": f"{float(config.binding_rms_min_ratio):.8g}",
         "native_binding_rms_max_ratio": f"{float(config.binding_rms_max_ratio):.8g}",
-        "native_binding_head": "slot_count_group_v2",
+        "native_binding_head": "slot_count_group_separator_v3",
         "native_layer_mixer": "token_dependent_softmax_v2_full_attention_milestones",
         "native_semantic_block": "rmsnorm_silu_residual_mlp_v1",
         "native_output_projection": "learned_linear_bias_v1",

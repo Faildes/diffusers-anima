@@ -741,6 +741,16 @@ def load_text_encoder_single_file(
             }
             if not metadata.get("native_binding_head"):
                 missing_head = [key for key in missing_head if key not in legacy_binding_missing]
+
+            # v6 adds separator provenance as a zero-gated residual. v2/v4/v5
+            # native artifacts are safe upgrade sources: missing separator
+            # tensors reproduce their previous output exactly until retrained.
+            legacy_separator_missing = {
+                "separator_embedding.weight",
+                "separator_gate",
+            }
+            if metadata.get("native_binding_head") != "slot_count_group_separator_v3":
+                missing_head = [key for key in missing_head if key not in legacy_separator_missing]
             if missing_head or unexpected_head:
                 raise RuntimeError(
                     "Anima-native head tensors do not match the checkpoint metadata. "

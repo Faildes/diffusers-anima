@@ -1035,18 +1035,80 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         return self
 
     def set_t5_query_strategy(self, strategy: str) -> "AnimaPipeline":
-        """Choose how the bounded T5/query side covers an overlength prompt.
+        """Choose bounded T5 query anchors while Qwen keeps full source memory.
 
-        ``"uniform"`` (default) samples query tokens across the complete text,
-        while ``"head"`` reproduces ordinary first-511-token truncation. The
-        Qwen source memory is independent and is never shortened by this option.
+        ``group_aware`` (v6 default) preserves PromptPlan/subject boundaries and
+        fills the remaining query budget over the complete prompt. ``uniform``
+        spans the complete T5 stream without group priority; ``head`` is kept
+        only for compatibility A/B tests.
         """
         if self.prompt_tokenizer is None:
             raise RuntimeError("prompt_tokenizer is not initialised")
         normalized = str(strategy).strip().lower()
-        if normalized not in {"head", "uniform"}:
-            raise ValueError("strategy must be 'head' or 'uniform'")
+        if normalized not in {"head", "uniform", "group_aware"}:
+            raise ValueError("strategy must be 'head', 'uniform', or 'group_aware'")
         self.prompt_tokenizer.t5_query_strategy = normalized
+        return self
+
+    def set_t5_query_max_length(self, max_length: int = 224) -> "AnimaPipeline":
+        """Set the stable adapter-query budget without capping Qwen source memory.
+
+        This is deliberately separate from ``set_qwen_source_max_length``. The
+        full Qwen sequence remains available to every adapter cross-attention;
+        T5 IDs are only the bounded learned queries into that semantic memory.
+        """
+        if self.prompt_tokenizer is None:
+            raise RuntimeError("prompt_tokenizer is not initialised")
+        value = int(max_length)
+        if not 16 <= value <= 512:
+            raise ValueError("max_length must be in [16, 512]")
+        self.prompt_tokenizer.t5_query_max_length = value
+        return self
+
+    def set_adapter_target_stability(
+        self,
+        *,
+        reference_length: int | None = None,
+        mode: str | None = None,
+        window_size: int | None = None,
+        overlap: int | None = None,
+        router_floor: float | None = None,
+        density_power: float | None = None,
+        density_min_scale: float | None = None,
+    ) -> "AnimaPipeline":
+        """Configure v6 no-pruning target/query stability for direct callers."""
+        adapter = self.transformer.llm_adapter
+        if reference_length is not None:
+            if not 16 <= int(reference_length) <= 512:
+                raise ValueError("reference_length must be in [16, 512]")
+            adapter.target_stability_reference_length = int(reference_length)
+        if mode is not None:
+            normalized = str(mode).strip().lower()
+            if normalized not in {"windowed", "legacy"}:
+                raise ValueError("mode must be 'windowed' or 'legacy'")
+            adapter.target_long_context_mode = normalized
+        if window_size is not None:
+            if not 16 <= int(window_size) <= 512:
+                raise ValueError("window_size must be in [16, 512]")
+            adapter.target_long_context_window_size = int(window_size)
+        if overlap is not None:
+            if int(overlap) < 0:
+                raise ValueError("overlap must be >= 0")
+            adapter.target_long_context_overlap = int(overlap)
+        if int(adapter.target_long_context_overlap) >= int(adapter.target_long_context_window_size):
+            raise ValueError("target overlap must be smaller than target window_size")
+        if router_floor is not None:
+            if not 0.0 <= float(router_floor) <= 1.0:
+                raise ValueError("router_floor must be in [0, 1]")
+            adapter.target_long_context_router_floor = float(router_floor)
+        if density_power is not None:
+            if float(density_power) < 0.0:
+                raise ValueError("density_power must be >= 0")
+            adapter.target_density_power = float(density_power)
+        if density_min_scale is not None:
+            if not 0.0 < float(density_min_scale) <= 1.0:
+                raise ValueError("density_min_scale must be in (0, 1]")
+            adapter.target_density_min_scale = float(density_min_scale)
         return self
 
     def set_adapter_source_position_mode(self, mode: str) -> "AnimaPipeline":

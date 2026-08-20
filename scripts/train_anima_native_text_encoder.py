@@ -125,7 +125,7 @@ class NativeEncoderTrainingConfig:
     # Multi-person / exact-count prompts benefit disproportionately from the
     # stable Anima behaviour of Qwen3-0.6B. Use the 0.6B anchor more often for
     # those prompts without letting it dominate normal single-subject prompts.
-    multi_person_reference_fraction: float = 1.00
+    multi_person_reference_fraction: float = 0.75
     reference_max_length: int = 256
     fused_adamw: bool = True
     allow_tf32: bool = True
@@ -138,11 +138,16 @@ class NativeEncoderTrainingConfig:
     distribution_weight: float = 0.20
     channel_distribution_weight: float = 0.06
     binding_geometry_weight: float = 0.35
-    multi_person_compat_weight: float = 0.40
+    multi_person_compat_weight: float = 0.20
     count_anchor_weight: float = 0.45
-    subject_slot_anchor_weight: float = 0.40
-    ownership_anchor_weight: float = 0.30
-    multi_person_reference_boost: float = 0.50
+    subject_slot_anchor_weight: float = 0.10
+    ownership_anchor_weight: float = 0.05
+    multi_person_reference_boost: float = 0.10
+    # v6: character/pose/outfit identity is owned by Qwen3.5 source geometry.
+    # The 0.6B reference remains a count/distribution stability teacher only.
+    subject_identity_margin_weight: float = 0.60
+    subject_identity_margin_ratio: float = 0.90
+    subject_identity_margin_floor: float = 0.04
     # v5 prompt-obedience objectives. These explicitly preserve instruction
     # contrasts while collapsing tag/natural-language paraphrases that describe
     # the same requested image.
@@ -714,6 +719,115 @@ def _infer_training_subject_controls(
     return group_ids, counts
 
 
+def _infer_training_separator_ids(
+    texts: Sequence[str],
+    offsets: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    *,
+    device: str,
+) -> torch.Tensor | None:
+    """Mark semicolon/AND/BREAK boundaries for separator-head training."""
+    if offsets is None:
+        return None
+    bsz, seq_len = attention_mask.shape
+    result = torch.zeros((bsz, seq_len), dtype=torch.long, device=device)
+    any_boundary = False
+    patterns = (
+        (re.compile(r";"), 1),
+        (re.compile(r"(?i)\bAND\b"), 2),
+        (re.compile(r"(?i)\bBREAK\b|\n"), 3),
+    )
+    for b, text in enumerate(texts):
+        boundaries: list[tuple[int, int]] = []
+        for pattern, sep_id in patterns:
+            boundaries.extend((m.end(), sep_id) for m in pattern.finditer(text))
+        boundaries.sort(key=lambda item: item[0])
+        for boundary_end, sep_id in boundaries:
+            for t in range(min(seq_len, offsets.shape[1])):
+                if int(attention_mask[b, t].item()) <= 0:
+                    continue
+                token_start = int(offsets[b, t, 0].item())
+                if token_start >= int(boundary_end):
+                    if int(result[b, t].item()) == 0:
+                        result[b, t] = int(sep_id)
+                        any_boundary = True
+                    break
+    return result if any_boundary else None
+
+
+def _subject_identity_margin_loss(
+    student: torch.Tensor,
+    source: torch.Tensor,
+    mask: torch.Tensor,
+    group_ids: torch.Tensor | None,
+    *,
+    ratio: float,
+    floor: float,
+) -> torch.Tensor:
+    """Prevent subject centroids from collapsing below Qwen3.5 separation.
+
+    Unlike the 0.6B ownership anchor, this uses the richer 0.8B source as the
+    semantic teacher for character identity, pose, clothing, and position.
+    """
+    if group_ids is None:
+        return student.new_zeros(())
+    losses: list[torch.Tensor] = []
+    valid_mask = mask.bool()
+    for b in range(student.shape[0]):
+        gids = [int(x) for x in torch.unique(group_ids[b][valid_mask[b]]).tolist() if int(x) > 0]
+        if len(gids) < 2:
+            continue
+        s_centers: dict[int, torch.Tensor] = {}
+        q_centers: dict[int, torch.Tensor] = {}
+        for gid in gids:
+            idx = valid_mask[b] & (group_ids[b] == gid)
+            if not bool(idx.any()):
+                continue
+            s_centers[gid] = student[b, idx].mean(dim=0, keepdim=True)
+            q_centers[gid] = source[b, idx].detach().mean(dim=0, keepdim=True)
+        keys = sorted(s_centers)
+        for i, ga in enumerate(keys):
+            for gb in keys[i + 1:]:
+                ds = _cosine_distance(s_centers[ga], s_centers[gb]).squeeze(0)
+                dq = _cosine_distance(q_centers[ga], q_centers[gb]).squeeze(0)
+                margin = torch.clamp(
+                    dq * max(0.0, float(ratio)),
+                    min=max(0.0, float(floor)),
+                    max=0.40,
+                )
+                losses.append(torch.relu(margin - ds))
+    return torch.stack(losses).mean() if losses else student.new_zeros(())
+
+
+def _multi_person_distribution_anchor_loss(
+    student: torch.Tensor,
+    reference: torch.Tensor | None,
+    student_mask: torch.Tensor,
+    reference_mask: torch.Tensor | None,
+    subject_counts: torch.Tensor | None,
+) -> torch.Tensor:
+    """Use 0.6B only for multi-person activation scale, not semantic direction."""
+    if reference is None or reference_mask is None:
+        return student.new_zeros(())
+    multi = _multi_person_mask(subject_counts)
+    if multi is None or not bool(multi.any()):
+        return student.new_zeros(())
+    losses: list[torch.Tensor] = []
+    for b in torch.nonzero(multi, as_tuple=False).flatten().tolist():
+        sm = student_mask[b].bool()
+        rm = reference_mask[b].bool()
+        if not bool(sm.any()) or not bool(rm.any()):
+            continue
+        sh = student[b, sm].float()
+        rh = reference[b, rm].detach().to(device=student.device).float()
+        srms = sh.square().mean().add(1e-8).sqrt()
+        rrms = rh.square().mean().add(1e-8).sqrt()
+        sstd = sh.std(unbiased=False).clamp_min(1e-6)
+        rstd = rh.std(unbiased=False).clamp_min(1e-6)
+        losses.append(torch.log(srms / rrms).abs() + 0.5 * torch.log(sstd / rstd).abs())
+    return torch.stack(losses).mean() if losses else student.new_zeros(())
+
+
 def _group_binding_geometry_loss(
     student: torch.Tensor,
     source: torch.Tensor,
@@ -794,16 +908,21 @@ def _multi_person_mask(subject_counts: torch.Tensor | None) -> torch.Tensor | No
 def _count_anchor_loss(
     student_pool: torch.Tensor,
     target_pool: torch.Tensor | None,
-    subject_counts: torch.Tensor | None,
+    pairs: Sequence[tuple[int, int, str]],
 ) -> torch.Tensor:
+    """Match only exact-count hard-negative geometry to the 0.6B anchor."""
     if target_pool is None:
         return student_pool.new_zeros(())
-    multi_mask = _multi_person_mask(subject_counts)
-    if multi_mask is None or int(multi_mask.sum().item()) <= 0:
-        return student_pool.new_zeros(())
-    sp = student_pool[multi_mask]
-    tp = target_pool[multi_mask].detach().to(device=student_pool.device, dtype=student_pool.dtype)
-    return _cosine_distance(sp, tp).mean() + 0.25 * _normalized_mse(sp, tp)
+    losses: list[torch.Tensor] = []
+    for a, b, category in pairs:
+        if category != "count_binding":
+            continue
+        ds = _cosine_distance(student_pool[a:a+1], student_pool[b:b+1]).squeeze(0)
+        dt = _cosine_distance(target_pool[a:a+1], target_pool[b:b+1]).squeeze(0).detach().to(
+            device=student_pool.device, dtype=student_pool.dtype
+        )
+        losses.append(F.smooth_l1_loss(ds, dt))
+    return torch.stack(losses).mean() if losses else student_pool.new_zeros(())
 
 
 def _ownership_anchor_loss(
@@ -1001,10 +1120,14 @@ def _evaluate_validation(
             batch, src.get("offset_mapping"), src["attention_mask"],
             device=device, max_subject_slots=int(student.native_head.native_config.max_subject_slots),
         )
+        separator_ids = _infer_training_separator_ids(
+            batch, src.get("offset_mapping"), src["attention_mask"], device=device
+        )
         with torch.inference_mode():
             out = student(
                 input_ids=src["input_ids"], attention_mask=src["attention_mask"],
                 anima_group_ids=group_ids, anima_subject_counts=subject_counts,
+                anima_separator_ids=separator_ids,
                 use_cache=False, return_dict=True,
             )
             hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
@@ -1110,8 +1233,8 @@ def _save_native_encoder(
         "training_steps": str(int(steps)),
         "training_final_loss": f"{float(final_loss):.8g}",
         "training_last_n_layers": str(int(config.train_last_n_layers)),
-        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience",
-        "knowledge_policy": "preserve_qwen35_vocab_knowledge_multilingual_geometry_qwen3_is_compat_anchor",
+        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v6_identity_safe_query_stability",
+        "knowledge_policy": "qwen35_owns_identity_pose_ownership_qwen3_06b_count_distribution_anchor",
         "training_budget_mode": "fixed_optimizer_steps",
         "training_fixed_budget_steps": str(int(config.fixed_budget_steps)),
         "training_balanced_sampling": "true" if config.balanced_sampling else "false",
@@ -1120,6 +1243,9 @@ def _save_native_encoder(
         "training_count_anchor_weight": f"{float(config.count_anchor_weight):.8g}",
         "training_subject_slot_anchor_weight": f"{float(config.subject_slot_anchor_weight):.8g}",
         "training_ownership_anchor_weight": f"{float(config.ownership_anchor_weight):.8g}",
+        "training_subject_identity_margin_weight": f"{float(config.subject_identity_margin_weight):.8g}",
+        "training_subject_identity_margin_ratio": f"{float(config.subject_identity_margin_ratio):.8g}",
+        "training_subject_identity_margin_floor": f"{float(config.subject_identity_margin_floor):.8g}",
         "training_instruction_fidelity_weight": f"{float(config.instruction_fidelity_weight):.8g}",
         "training_tag_nl_equivalence_weight": f"{float(config.tag_nl_equivalence_weight):.8g}",
         "training_instruction_margin_floor": f"{float(config.instruction_margin_floor):.8g}",
@@ -1419,6 +1545,9 @@ def train_anima_native_text_encoder(
                 device=device,
                 max_subject_slots=int(student.native_head.native_config.max_subject_slots),
             )
+            separator_ids = _infer_training_separator_ids(
+                texts, src.get("offset_mapping"), src["attention_mask"], device=device
+            )
 
             # Qwen3-0.6B is intentionally an Anima-distribution anchor, not the
             # semantic teacher.  Sampling anchor batches avoids a full second
@@ -1427,7 +1556,10 @@ def train_anima_native_text_encoder(
             reference_fraction = max(0.05, min(1.0, float(cfg.reference_batch_fraction)))
             multi_person_fraction = max(reference_fraction, min(1.0, float(cfg.multi_person_reference_fraction)))
             batch_bucket = {group_sampling_bucket(group) for group in group_batch}
-            batch_has_multi_person = bool(batch_bucket & {"binding", "count", "multilingual"})
+            batch_has_multi_person = bool(
+                (subject_counts is not None and bool((subject_counts.reshape(-1) >= 2).any()))
+                or batch_bucket & {"binding", "count"}
+            )
             active_reference_fraction = multi_person_fraction if batch_has_multi_person else reference_fraction
             use_reference = micro_step_global == 1 or rng.random() < active_reference_fraction
             ref: dict[str, torch.Tensor] | None = None
@@ -1449,6 +1581,7 @@ def train_anima_native_text_encoder(
                 attention_mask=src["attention_mask"],
                 group_ids=group_ids,
                 subject_counts=subject_counts,
+                separator_ids=separator_ids,
                 return_details=True,
             )
             source_hidden = details["final_hidden"]
@@ -1524,6 +1657,18 @@ def train_anima_native_text_encoder(
             if ref_pool is not None:
                 compat_each = _cosine_distance(student_pool, ref_pool)
                 compat_each = compat_each + 0.25 * _normalized_mse_each(student_pool, ref_pool)
+                # On multi-person prompts the 0.6B model is not allowed to
+                # overwrite richer 0.8B identity/pose/ownership geometry.
+                # Keep only a weak absolute compatibility pull; dedicated count
+                # and distribution anchors below retain Anima stability.
+                multi_for_compat = _multi_person_mask(subject_counts)
+                if multi_for_compat is not None:
+                    semantic_scale = torch.where(
+                        multi_for_compat.to(device=device),
+                        torch.full_like(compat_each, 0.35),
+                        torch.ones_like(compat_each),
+                    )
+                    compat_each = compat_each * semantic_scale
                 compat = reference_scale * (
                     (compat_each * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
                 )
@@ -1542,11 +1687,21 @@ def train_anima_native_text_encoder(
             count_anchor = student_pool.new_zeros(())
             slot_anchor = student_pool.new_zeros(())
             ownership_anchor = student_pool.new_zeros(())
+            subject_identity_margin = _subject_identity_margin_loss(
+                native_hidden,
+                source_hidden.detach(),
+                src["attention_mask"],
+                group_ids,
+                ratio=float(cfg.subject_identity_margin_ratio),
+                floor=float(cfg.subject_identity_margin_floor),
+            )
             if ref_hidden is not None and ref is not None and ref_pool is not None:
                 ref_hidden_device = ref_hidden.to(device=device, dtype=native_hidden.dtype)
                 ref_mask = ref["attention_mask"].to(device)
-                multi_person_compat = reference_scale * _count_anchor_loss(student_pool, ref_pool, subject_counts)
-                count_anchor = reference_scale * _count_anchor_loss(student_pool, ref_pool, subject_counts)
+                multi_person_compat = reference_scale * _multi_person_distribution_anchor_loss(
+                    native_hidden, ref_hidden_device, src["attention_mask"], ref_mask, subject_counts
+                )
+                count_anchor = reference_scale * _count_anchor_loss(student_pool, ref_pool, pairs)
                 slot_anchor = reference_scale * _slot_centroid_anchor_loss(
                     native_hidden,
                     ref_hidden_device,
@@ -1623,6 +1778,7 @@ def train_anima_native_text_encoder(
                 + float(cfg.count_anchor_weight) * count_anchor
                 + float(cfg.subject_slot_anchor_weight) * slot_anchor
                 + float(cfg.ownership_anchor_weight) * ownership_anchor
+                + float(cfg.subject_identity_margin_weight) * subject_identity_margin
                 + float(cfg.instruction_fidelity_weight) * instruction_fidelity
                 + float(cfg.tag_nl_equivalence_weight) * tag_nl_equivalence
                 + float(cfg.distribution_weight) * distribution
@@ -1889,13 +2045,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--pair-fraction", type=float, default=0.35)
     p.add_argument("--binding-pairs", type=int, default=256)
     p.add_argument("--reference-batch-fraction", type=float, default=0.50)
-    p.add_argument("--multi-person-reference-fraction", type=float, default=1.00)
+    p.add_argument("--multi-person-reference-fraction", type=float, default=0.75)
     p.add_argument("--reference-max-length", type=int, default=256)
-    p.add_argument("--multi-person-compat-weight", type=float, default=0.40)
+    p.add_argument("--multi-person-compat-weight", type=float, default=0.20)
     p.add_argument("--count-anchor-weight", type=float, default=0.45)
-    p.add_argument("--subject-slot-anchor-weight", type=float, default=0.40)
-    p.add_argument("--ownership-anchor-weight", type=float, default=0.30)
-    p.add_argument("--multi-person-reference-boost", type=float, default=0.50)
+    p.add_argument("--subject-slot-anchor-weight", type=float, default=0.10)
+    p.add_argument("--ownership-anchor-weight", type=float, default=0.05)
+    p.add_argument("--multi-person-reference-boost", type=float, default=0.10)
+    p.add_argument("--subject-identity-margin-weight", type=float, default=0.60)
+    p.add_argument("--subject-identity-margin-ratio", type=float, default=0.90)
+    p.add_argument("--subject-identity-margin-floor", type=float, default=0.04)
     p.add_argument("--instruction-fidelity-weight", type=float, default=0.55)
     p.add_argument("--tag-nl-equivalence-weight", type=float, default=0.35)
     p.add_argument("--instruction-margin-floor", type=float, default=0.05)
@@ -1947,6 +2106,9 @@ def main() -> None:
         subject_slot_anchor_weight=a.subject_slot_anchor_weight,
         ownership_anchor_weight=a.ownership_anchor_weight,
         multi_person_reference_boost=a.multi_person_reference_boost,
+        subject_identity_margin_weight=a.subject_identity_margin_weight,
+        subject_identity_margin_ratio=a.subject_identity_margin_ratio,
+        subject_identity_margin_floor=a.subject_identity_margin_floor,
         instruction_fidelity_weight=a.instruction_fidelity_weight,
         tag_nl_equivalence_weight=a.tag_nl_equivalence_weight,
         instruction_margin_floor=a.instruction_margin_floor,

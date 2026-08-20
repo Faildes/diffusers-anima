@@ -454,6 +454,7 @@ class _AdapterBlock(nn.Module):
         pos_target: tuple[torch.Tensor, torch.Tensor],
         pos_source: tuple[torch.Tensor, torch.Tensor] | None,
         long_context_options: dict[str, Any] | None = None,
+        target_long_context_options: dict[str, Any] | None = None,
         rope: _RotaryEmbedding | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(
@@ -461,6 +462,8 @@ class _AdapterBlock(nn.Module):
             attn_mask=target_mask,
             pos_q=pos_target,
             pos_k=pos_target,
+            long_context_options=target_long_context_options,
+            rope=rope,
         )
         x = x + self.cross_attn(
             self.norm_cross_attn(x),
@@ -508,6 +511,18 @@ class _LLMAdapter(nn.Module):
         self.long_context_rms_min_ratio = 0.92
         self.long_context_rms_max_ratio = 1.08
 
+        # v6 target/query stability. Empirical Anima checkpoints start drifting
+        # as active T5 queries approach ~256 and can collapse near 512. Keep the
+        # normal tokenizer below that regime (224), and defensively page any
+        # externally supplied denser target sequence without dropping a query.
+        self.target_stability_reference_length = 224
+        self.target_long_context_mode = "windowed"
+        self.target_long_context_window_size = 192
+        self.target_long_context_overlap = 32
+        self.target_long_context_router_floor = 0.02
+        self.target_density_power = 0.50
+        self.target_density_min_scale = 0.70
+
     def forward(
         self,
         source_hidden_states: torch.Tensor,
@@ -521,10 +536,14 @@ class _LLMAdapter(nn.Module):
         target_hidden_states = self.embed(target_input_ids)
         source_context = source_hidden_states
 
-        target_position_ids = _build_position_ids(
+        # Keep target/query RoPE inside the empirically stable native regime.
+        # Every query remains present; only adapter-side coordinates are
+        # continuously compressed when an external caller supplies >reference.
+        target_position_ids = _build_source_position_ids(
             batch_size=target_hidden_states.shape[0],
             length=target_hidden_states.shape[1],
             device=target_hidden_states.device,
+            trained_length=max(2, int(self.target_stability_reference_length)),
         )
         use_windowed_long_context = (
             self.long_context_mode == "windowed"
@@ -564,6 +583,24 @@ class _LLMAdapter(nn.Module):
             "rms_min_ratio": float(self.long_context_rms_min_ratio),
             "rms_max_ratio": float(self.long_context_rms_max_ratio),
         }
+        target_long_context_options = {
+            "enabled": (
+                self.target_long_context_mode == "windowed"
+                and int(target_hidden_states.shape[1]) > int(self.target_stability_reference_length)
+            ),
+            "threshold": int(self.target_stability_reference_length),
+            "window_size": min(
+                int(self.target_long_context_window_size),
+                int(self.target_stability_reference_length),
+            ),
+            "overlap": int(self.target_long_context_overlap),
+            "router_top_k": 0,
+            "router_temperature": 1.0,
+            "locality_strength": 0.35,
+            "router_floor": float(self.target_long_context_router_floor),
+            "rms_min_ratio": 0.94,
+            "rms_max_ratio": 1.06,
+        }
 
         hidden_states = target_hidden_states
         for block in self.blocks:
@@ -575,9 +612,29 @@ class _LLMAdapter(nn.Module):
                 pos_target=target_position_embed,
                 pos_source=source_position_embed,
                 long_context_options=long_context_options,
+                target_long_context_options=target_long_context_options,
                 rope=self.rope,
             )
-        return self.norm(self.out_proj(hidden_states))
+        output = self.norm(self.out_proj(hidden_states))
+
+        # Density guard for callers that bypass AnimaPromptTokenizer.  This does
+        # not remove or merge any target/source token; it only prevents the
+        # aggregate conditioning energy from growing with active query count.
+        if target_attention_mask is None:
+            active = torch.full(
+                (output.shape[0], 1, 1),
+                float(output.shape[1]),
+                device=output.device,
+                dtype=torch.float32,
+            )
+        else:
+            active = target_attention_mask.to(device=output.device, dtype=torch.float32).sum(dim=-1)
+            active = active.reshape(output.shape[0], 1, 1).clamp_min(1.0)
+        reference = float(max(1, int(self.target_stability_reference_length)))
+        ratio = torch.clamp(reference / active, max=1.0)
+        scale = ratio.pow(max(0.0, float(self.target_density_power)))
+        scale = scale.clamp(min=max(0.0, min(1.0, float(self.target_density_min_scale))), max=1.0)
+        return output * scale.to(dtype=output.dtype)
 
 
 class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
