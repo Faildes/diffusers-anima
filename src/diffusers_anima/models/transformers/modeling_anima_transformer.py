@@ -553,13 +553,13 @@ class _LLMAdapter(nn.Module):
         self.long_context_rms_min_ratio = 0.92
         self.long_context_rms_max_ratio = 1.08
 
-        # v8 full-T5 single-pass stability.  No T5 query is selected, merged,
-        # truncated, position-compressed, or paged.  Instead, when the active
-        # query count leaves the empirically safe range, target self-attention
-        # receives zero-valued K/V sink entries so its softmax competition does
-        # not become progressively denser. The real query sequence/order stays
-        # byte-for-byte aligned with the T5 tokenizer output.
-        self.target_null_stability_enabled = True
+        # v9 restores the original/v5 Anima T5 topology exactly by default:
+        # one ordered T5 query stream, ordinary target self-attention, one adapter
+        # pass, and one DiT pass. No semantic query is selected or paged.  The
+        # experimental v8 null-sink machinery remains available only for A/B
+        # diagnostics and is disabled because expanding conditioning length past
+        # the real query length caused severe OOD behaviour in the Cosmos DiT.
+        self.target_null_stability_enabled = False
         self.target_stability_start_length = 224
         self.target_stability_full_length = 384
         self.target_reference_active = 224
@@ -693,12 +693,11 @@ class _LLMAdapter(nn.Module):
             "rms_min_ratio": float(self.long_context_rms_min_ratio),
             "rms_max_ratio": float(self.long_context_rms_max_ratio),
         }
-        target_null_counts = self.target_null_key_counts(
-            target_attention_mask,
-            batch_size=target_hidden_states.shape[0],
-            target_length=target_hidden_states.shape[1],
-            device=target_hidden_states.device,
-        )
+        # v9: the stock Anima adapter never injected synthetic target K/V rows.
+        # Keep every real T5 query and preserve the exact vanilla attention
+        # competition. Null sinks can still be enabled manually for experiments,
+        # but are never used by the default full-stream path.
+        target_null_counts = None
 
         hidden_states = target_hidden_states
         for block in self.blocks:
@@ -781,10 +780,11 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if text_ids is None:
             return text_embeds
 
-        # v8 keeps the initial Anima single-pass T5 topology while preserving
-        # every query token. Stability is achieved with null attention sinks
-        # inside the adapter plus zero-only occupancy padding after it; neither
-        # operation selects, merges, averages, or rewrites semantic queries.
+        # v9 vanilla-contract full T5 stream. This deliberately matches the
+        # original Anima behaviour: run every real T5 query exactly once, then
+        # pad only short streams to the native 512-slot minimum.  Streams longer
+        # than 512 remain at their real length; no null rows, truncation, token
+        # selection, merging, averaging, or paging is performed.
         adapted = self.llm_adapter(
             text_embeds,
             text_ids,
@@ -797,13 +797,7 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             adapted = adapted * target_attention_mask.to(
                 device=adapted.device, dtype=adapted.dtype
             ).unsqueeze(-1)
-        stable_length = self.llm_adapter.stable_condition_length(
-            target_attention_mask,
-            batch_size=adapted.shape[0],
-            target_length=adapted.shape[1],
-            device=adapted.device,
-        )
-        return _pad_to_length(adapted, stable_length)
+        return _pad_to_length(adapted, max(512, int(adapted.shape[1])))
 
     def forward(
         self,
@@ -825,9 +819,9 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # CosmosTransformer3DModel internally repeats this per batch, so keep batch=1 here.
             padding_mask = _default_padding_mask(hidden_states)
 
-        # v8: one DiT call for the complete ordered conditioning stream. The
-        # appended rows are exact zeros and only recreate the null-slot density
-        # that short prompts had in the original 512-slot Anima implementation.
+        # v9: one DiT call for the complete ordered conditioning stream. Short
+        # streams are padded to 512 exactly like vanilla Anima; long streams are
+        # passed at their real length with no synthetic conditioning rows.
         sample = self.core(
             hidden_states=hidden_states,
             timestep=timestep,

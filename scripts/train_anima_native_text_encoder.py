@@ -126,7 +126,14 @@ class NativeEncoderTrainingConfig:
     # stable Anima behaviour of Qwen3-0.6B. Use the 0.6B anchor more often for
     # those prompts without letting it dominate normal single-subject prompts.
     multi_person_reference_fraction: float = 0.75
-    reference_max_length: int = 256
+    reference_max_length: int = 512
+    # v9: long prompts must never lose the 0.6B Anima-compatibility teacher at
+    # the old 256-token boundary. Long batches always receive the reference
+    # forward and a light relative-segment compatibility objective.
+    long_reference_min_tokens: int = 257
+    long_reference_fraction: float = 1.00
+    long_segment_compat_weight: float = 0.25
+    long_segment_count: int = 4
     fused_adamw: bool = True
     allow_tf32: bool = True
     # Losses.  Compatibility is important, but source geometry deliberately
@@ -661,6 +668,94 @@ def _tokenize(
     return result
 
 
+def _resolved_reference_max_length(max_length: int, reference_max_length: int) -> int:
+    """Resolve the 0.6B teacher window without a hidden 256-token cliff."""
+    source_limit = max(32, int(max_length))
+    reference_limit = int(reference_max_length)
+    if reference_limit <= 0:
+        return source_limit
+    return max(32, min(source_limit, reference_limit))
+
+
+def _relative_segment_pools(
+    hidden: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    segments: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pool each valid stream into equal relative-position segments."""
+    segments = max(1, int(segments))
+    pooled: list[torch.Tensor] = []
+    valid_rows: list[torch.Tensor] = []
+    for b in range(hidden.shape[0]):
+        valid_idx = torch.nonzero(mask[b].bool(), as_tuple=False).flatten()
+        length = int(valid_idx.numel())
+        row: list[torch.Tensor] = []
+        row_valid = torch.zeros(segments, device=hidden.device, dtype=torch.bool)
+        for s in range(segments):
+            if length <= 0:
+                row.append(hidden.new_zeros((hidden.shape[-1],)))
+                continue
+            lo = (length * s) // segments
+            hi = (length * (s + 1)) // segments
+            if hi <= lo:
+                row.append(hidden.new_zeros((hidden.shape[-1],)))
+                continue
+            idx = valid_idx[lo:hi]
+            row.append(hidden[b, idx].mean(dim=0))
+            row_valid[s] = True
+        pooled.append(torch.stack(row, dim=0))
+        valid_rows.append(row_valid)
+    return torch.stack(pooled, dim=0), torch.stack(valid_rows, dim=0)
+
+
+def _long_segment_compat_loss(
+    student: torch.Tensor,
+    reference: torch.Tensor | None,
+    student_mask: torch.Tensor,
+    reference_mask: torch.Tensor | None,
+    *,
+    min_tokens: int,
+    segments: int,
+    multi_person_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Keep the 0.6B Anima-compatible geometry across long-prompt tails.
+
+    Relative segments avoid assuming identical tokenization between Qwen3 and
+    Qwen3.5. The objective is intentionally light; Qwen3.5 still owns detailed
+    character, pose, clothing, position, multilingual and knowledge geometry.
+    """
+    if reference is None or reference_mask is None:
+        return student.new_zeros(())
+    lengths = student_mask.to(dtype=torch.long).sum(dim=-1)
+    long_rows = lengths >= max(1, int(min_tokens))
+    if not bool(long_rows.any()):
+        return student.new_zeros(())
+    sp, sv = _relative_segment_pools(student, student_mask, segments=segments)
+    rp, rv = _relative_segment_pools(
+        reference.detach().to(device=student.device, dtype=student.dtype),
+        reference_mask.to(device=student.device),
+        segments=segments,
+    )
+    valid = sv & rv & long_rows.unsqueeze(-1)
+    if not bool(valid.any()):
+        return student.new_zeros(())
+    cosine = 1.0 - F.cosine_similarity(sp.float(), rp.float(), dim=-1)
+    # Scale MSE by reference RMS so this regulariser does not dominate solely
+    # because the two encoder families use slightly different activation scale.
+    ref_scale = rp.float().square().mean(dim=-1).sqrt().clamp_min(1e-3)
+    mse = ((sp.float() - rp.float()).square().mean(dim=-1) / ref_scale.square())
+    row_scale = torch.ones(student.shape[0], device=student.device, dtype=torch.float32)
+    if multi_person_mask is not None:
+        row_scale = torch.where(
+            multi_person_mask.to(device=student.device, dtype=torch.bool),
+            torch.full_like(row_scale, 0.5),
+            row_scale,
+        )
+    per = (cosine + 0.10 * mse) * row_scale.unsqueeze(-1)
+    return per[valid].mean()
+
+
 def _infer_training_subject_controls(
     texts: Sequence[str],
     offsets: torch.Tensor | None,
@@ -1076,7 +1171,7 @@ def _build_validation_targets(
         src = _tokenize(source_tok, batch, device=device, max_length=max_length)
         ref = _tokenize(
             ref_tok, batch, device=ref_device,
-            max_length=min(max_length, max(32, int(reference_max_length))),
+            max_length=_resolved_reference_max_length(max_length, reference_max_length),
         )
         with torch.inference_mode():
             source_out = student.backbone(
@@ -1233,8 +1328,8 @@ def _save_native_encoder(
         "training_steps": str(int(steps)),
         "training_final_loss": f"{float(final_loss):.8g}",
         "training_last_n_layers": str(int(config.train_last_n_layers)),
-        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v6_identity_safe_query_stability",
-        "knowledge_policy": "qwen35_owns_identity_pose_ownership_qwen3_06b_count_distribution_anchor",
+        "training_policy": "qwen35_fixed_budget_balanced_best_validation_v9_full_reference_t5_vanilla",
+        "knowledge_policy": "qwen35_owns_identity_pose_ownership_qwen3_06b_full_length_anima_anchor",
         "training_budget_mode": "fixed_optimizer_steps",
         "training_fixed_budget_steps": str(int(config.fixed_budget_steps)),
         "training_balanced_sampling": "true" if config.balanced_sampling else "false",
@@ -1261,6 +1356,10 @@ def _save_native_encoder(
         "sampling_bucket_weights_json": json.dumps(default_sampling_bucket_weights(), sort_keys=True, separators=(",", ":")),
         "reference_batch_fraction": f"{float(config.reference_batch_fraction):.8g}",
         "reference_max_length": str(int(config.reference_max_length)),
+        "training_long_reference_min_tokens": str(int(config.long_reference_min_tokens)),
+        "training_long_reference_fraction": f"{float(config.long_reference_fraction):.8g}",
+        "training_long_segment_compat_weight": f"{float(config.long_segment_compat_weight):.8g}",
+        "training_long_segment_count": str(int(config.long_segment_count)),
         "bootstrap_bridge_used": "true" if config.bootstrap_bridge_profile else "false",
         "runtime_conditioning_mode": "native_encoder_direct",
     }
@@ -1483,6 +1582,9 @@ def train_anima_native_text_encoder(
         reference_batch_fraction=f"{float(cfg.reference_batch_fraction):.3f}",
         multi_person_reference_fraction=f"{float(cfg.multi_person_reference_fraction):.3f}",
         reference_max_length=int(cfg.reference_max_length),
+        long_reference_min_tokens=int(cfg.long_reference_min_tokens),
+        long_reference_fraction=f"{float(cfg.long_reference_fraction):.3f}",
+        long_segment_compat_weight=f"{float(cfg.long_segment_compat_weight):.3f}",
         fused_adamw=bool(adamw_kwargs.get("fused", False)),
         warmup_steps=warmup,
     )
@@ -1561,6 +1663,12 @@ def train_anima_native_text_encoder(
                 or batch_bucket & {"binding", "count"}
             )
             active_reference_fraction = multi_person_fraction if batch_has_multi_person else reference_fraction
+            batch_max_source_tokens = int(src["attention_mask"].sum(dim=-1).max().item())
+            if batch_max_source_tokens >= max(1, int(cfg.long_reference_min_tokens)):
+                active_reference_fraction = max(
+                    active_reference_fraction,
+                    max(0.05, min(1.0, float(cfg.long_reference_fraction))),
+                )
             use_reference = micro_step_global == 1 or rng.random() < active_reference_fraction
             ref: dict[str, torch.Tensor] | None = None
             ref_hidden: torch.Tensor | None = None
@@ -1591,7 +1699,7 @@ def train_anima_native_text_encoder(
                     ref_tok,
                     texts,
                     device=ref_device,
-                    max_length=min(int(cfg.max_length), max(32, int(cfg.reference_max_length))),
+                    max_length=_resolved_reference_max_length(int(cfg.max_length), int(cfg.reference_max_length)),
                     include_offsets=need_offsets,
                 )
                 with torch.inference_mode():
@@ -1711,6 +1819,17 @@ def train_anima_native_text_encoder(
                     ref_group_ids.to(device) if ref_group_ids is not None else None,
                 )
                 ownership_anchor = reference_scale * _ownership_anchor_loss(student_pool, ref_pool, pairs)
+            long_segment_compat = _long_segment_compat_loss(
+                native_hidden,
+                ref_hidden.to(device=device, dtype=native_hidden.dtype) if ref_hidden is not None else None,
+                src["attention_mask"],
+                ref["attention_mask"] if ref is not None else None,
+                min_tokens=int(cfg.long_reference_min_tokens),
+                segments=int(cfg.long_segment_count),
+                multi_person_mask=_multi_person_mask(subject_counts),
+            )
+            if ref_hidden is not None:
+                long_segment_compat = reference_scale * long_segment_compat
             instruction_fidelity = _instruction_fidelity_loss(
                 student_pool,
                 source_pool,
@@ -1778,6 +1897,7 @@ def train_anima_native_text_encoder(
                 + float(cfg.count_anchor_weight) * count_anchor
                 + float(cfg.subject_slot_anchor_weight) * slot_anchor
                 + float(cfg.ownership_anchor_weight) * ownership_anchor
+                + float(cfg.long_segment_compat_weight) * long_segment_compat
                 + float(cfg.subject_identity_margin_weight) * subject_identity_margin
                 + float(cfg.instruction_fidelity_weight) * instruction_fidelity
                 + float(cfg.tag_nl_equivalence_weight) * tag_nl_equivalence
@@ -1801,6 +1921,7 @@ def train_anima_native_text_encoder(
                 "count_anchor": float(count_anchor.detach().item()),
                 "slot_anchor": float(slot_anchor.detach().item()),
                 "ownership_anchor": float(ownership_anchor.detach().item()),
+                "long_segment_compat": float(long_segment_compat.detach().item()),
                 "instruction": float(instruction_fidelity.detach().item()),
                 "tag_nl_eq": float(tag_nl_equivalence.detach().item()),
                 "distribution": float(distribution.detach().item()),
@@ -1861,6 +1982,7 @@ def train_anima_native_text_encoder(
                         count_anchor=f"{avg_values.get('count_anchor', values['count_anchor']):.6f}",
                         slot_anchor=f"{avg_values.get('slot_anchor', values['slot_anchor']):.6f}",
                         ownership_anchor=f"{avg_values.get('ownership_anchor', values['ownership_anchor']):.6f}",
+                        long_compat=f"{avg_values.get('long_segment_compat', values['long_segment_compat']):.6f}",
                         instruction=f"{avg_values.get('instruction', values['instruction']):.6f}",
                         tag_nl_eq=f"{avg_values.get('tag_nl_eq', values['tag_nl_eq']):.6f}",
                         reference=f"{avg_values.get('reference', values['reference']):.3f}",
@@ -2046,7 +2168,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--binding-pairs", type=int, default=256)
     p.add_argument("--reference-batch-fraction", type=float, default=0.50)
     p.add_argument("--multi-person-reference-fraction", type=float, default=0.75)
-    p.add_argument("--reference-max-length", type=int, default=256)
+    p.add_argument("--reference-max-length", type=int, default=512)
+    p.add_argument("--long-reference-min-tokens", type=int, default=257)
+    p.add_argument("--long-reference-fraction", type=float, default=1.00)
+    p.add_argument("--long-segment-compat-weight", type=float, default=0.25)
+    p.add_argument("--long-segment-count", type=int, default=4)
     p.add_argument("--multi-person-compat-weight", type=float, default=0.20)
     p.add_argument("--count-anchor-weight", type=float, default=0.45)
     p.add_argument("--subject-slot-anchor-weight", type=float, default=0.10)
@@ -2101,6 +2227,10 @@ def main() -> None:
         reference_batch_fraction=a.reference_batch_fraction,
         multi_person_reference_fraction=a.multi_person_reference_fraction,
         reference_max_length=a.reference_max_length,
+        long_reference_min_tokens=a.long_reference_min_tokens,
+        long_reference_fraction=a.long_reference_fraction,
+        long_segment_compat_weight=a.long_segment_compat_weight,
+        long_segment_count=a.long_segment_count,
         multi_person_compat_weight=a.multi_person_compat_weight,
         count_anchor_weight=a.count_anchor_weight,
         subject_slot_anchor_weight=a.subject_slot_anchor_weight,

@@ -1213,7 +1213,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             "rms_max_ratio": float(adapter.long_context_rms_max_ratio),
             "full_source_coverage": int(adapter.long_context_router_top_k) == 0,
             "legacy_source_position_mode": str(adapter.source_position_mode),
-            "target_conditioning_length": "single_pass_full_query_null_stabilized",
+            "target_conditioning_length": "vanilla_single_pass_full_query_min512",
             "target_null_stability_enabled": bool(adapter.target_null_stability_enabled),
             "target_stability_start_length": int(adapter.target_stability_start_length),
             "target_stability_full_length": int(adapter.target_stability_full_length),

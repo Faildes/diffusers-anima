@@ -103,7 +103,7 @@ def test_v3_training_is_fixed_budget_balanced_and_best_validation_driven():
         '_evaluate_validation',
         '_snapshot_trainable_state',
         '_restore_trainable_state',
-        'qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience',
+        'qwen35_fixed_budget_balanced_best_validation_v9_full_reference_t5_vanilla',
         'training_best_step',
         'validation_neutral_channel',
     ):
@@ -158,7 +158,7 @@ def test_v5_training_adds_instruction_and_tag_nl_objectives():
         "tag_nl_equivalence_weight",
         "_instruction_fidelity_loss",
         "_tag_nl_equivalence_loss",
-        "qwen35_fixed_budget_balanced_best_validation_v5_fullcoverage_prompt_obedience",
+        "qwen35_fixed_budget_balanced_best_validation_v9_full_reference_t5_vanilla",
     ):
         assert marker in trainer
     for marker in ("build_instruction_fidelity_groups", "build_tag_nl_equivalence_groups"):
