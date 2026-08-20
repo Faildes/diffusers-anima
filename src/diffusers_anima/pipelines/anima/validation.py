@@ -67,6 +67,7 @@ _ANIMA_RUNTIME_OPTION_KEYS = {
     "dtype",
     "torch_dtype",
     "text_encoder_dtype",
+    "text_encoder_max_sequence_length",
 }
 _ANIMA_REMOVED_FROM_PRETRAINED_RUNTIME_FEATURE_KEYS = {
     "enable_model_cpu_offload",

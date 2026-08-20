@@ -39,14 +39,38 @@ class AnimaPromptTokenizer:
         self.qwen_tokenizer = qwen_tokenizer
         self.t5_tokenizer = t5_tokenizer
 
+    def __call__(self, *args, **kwargs):
+        """Delegate generic tokenizer calls to the primary source tokenizer.
+
+        This keeps older sd_embed integrations working while still exposing the
+        dual-tokenizer ``tokenize_with_weights`` API used by the Anima pipeline.
+        """
+        return self.qwen_tokenizer(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        return self.qwen_tokenizer.decode(*args, **kwargs)
+
+    @property
+    def model_max_length(self):
+        return getattr(self.qwen_tokenizer, "model_max_length", 512)
+
+    @property
+    def pad_token_id(self):
+        return self.qwen_tokenizer.pad_token_id
+
     def tokenize_with_weights(
-        self, text: str
+        self,
+        text: str,
+        *,
+        source_max_length: int | None = None,
+        target_max_length: int = _CONDITIONING_MAX_LENGTH,
     ) -> dict[str, list[list[tuple[int, float]]]]:
         qwen_ids = (
             self.qwen_tokenizer(
                 [text],
                 add_special_tokens=False,
-                truncation=False,
+                truncation=source_max_length is not None,
+                max_length=source_max_length,
                 return_tensors="pt",
             )
             .input_ids[0]
@@ -56,7 +80,8 @@ class AnimaPromptTokenizer:
             self.t5_tokenizer(
                 [text],
                 add_special_tokens=False,
-                truncation=False,
+                truncation=True,
+                max_length=max(1, int(target_max_length) - 1),
                 return_tensors="pt",
             )
             .input_ids[0]
@@ -106,6 +131,8 @@ def prepare_condition_inputs(
     *,
     execution_device: str,
     model_dtype: torch.dtype,
+    source_max_length: int | None = None,
+    target_max_length: int = _CONDITIONING_MAX_LENGTH,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tokenize and encode a batch of prompts into conditioning tensors.
 
@@ -119,7 +146,9 @@ def prepare_condition_inputs(
 
     qwen_pad = prompt_tokenizer.qwen_tokenizer.pad_token_id
     if qwen_pad is None:
-        qwen_pad = 151643
+        qwen_pad = prompt_tokenizer.qwen_tokenizer.eos_token_id
+    if qwen_pad is None:
+        qwen_pad = _QWEN3_DEFAULT_PAD_TOKEN_ID
     t5_pad = prompt_tokenizer.t5_tokenizer.pad_token_id
     if t5_pad is None:
         t5_pad = 0
@@ -131,7 +160,9 @@ def prepare_condition_inputs(
     max_t5_len = 0
 
     for text in prompt:
-        tokenized = prompt_tokenizer.tokenize_with_weights(text)
+        tokenized = prompt_tokenizer.tokenize_with_weights(
+            text, source_max_length=source_max_length, target_max_length=target_max_length
+        )
         qwen_token_ids, _ = _extract_ids_and_weights(tokenized["qwen3_06b"][0])
         t5_token_ids, t5_token_weights = _extract_ids_and_weights(tokenized["t5xxl"][0])
 
@@ -207,6 +238,8 @@ def build_condition(
         cond = transformer.preprocess_text_embeds(
             qwen_hidden, t5_ids, t5xxl_weights=t5_weights
         )
+    if cond.shape[1] > _CONDITIONING_MAX_LENGTH:
+        cond = cond[:, :_CONDITIONING_MAX_LENGTH]
     pad_len = max(0, _CONDITIONING_MAX_LENGTH - cond.shape[1])
     if pad_len > 0:
         cond = torch.nn.functional.pad(cond, (0, 0, 0, pad_len))

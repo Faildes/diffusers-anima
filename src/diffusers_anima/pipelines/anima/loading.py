@@ -19,6 +19,8 @@ from safetensors.torch import load_file
 import torch
 from transformers import AutoTokenizer, Qwen3Config, Qwen3Model
 
+from ...models.text_encoders import TCAtria1BModel, is_tcatria1b_directory
+
 from ...models.transformers.modeling_anima_transformer import (
     AnimaTransformerModel,
     _convert_anima_state_dict_to_diffusers,
@@ -237,6 +239,12 @@ def runtime_options_from_kwargs(
                 "Specify only one of `dtype` or `torch_dtype` for custom loading."
             )
         dtype_arg = torch_dtype_arg
+    text_encoder_max_sequence_length = get_value("text_encoder_max_sequence_length", None)
+    if text_encoder_max_sequence_length is not None:
+        text_encoder_max_sequence_length = int(text_encoder_max_sequence_length)
+        if text_encoder_max_sequence_length <= 0:
+            text_encoder_max_sequence_length = None
+
     return AnimaRuntimeOptions(
         device=str(get_value("device", "auto")),
         dtype=normalize_dtype_name(dtype_arg, name="dtype"),
@@ -244,6 +252,7 @@ def runtime_options_from_kwargs(
             get_value("text_encoder_dtype", "auto"),
             name="text_encoder_dtype",
         ),
+        text_encoder_max_sequence_length=text_encoder_max_sequence_length,
     )
 
 
@@ -605,7 +614,44 @@ def load_text_encoder(
     options: AnimaLoaderOptions,
     source: str = _TEXT_ENCODER_WEIGHTS,
     allow_remote_url: bool = False,
-) -> Qwen3Model:
+) -> torch.nn.Module:
+    """Load either the stock Qwen3-0.6B encoder or a TCAtria1B directory.
+
+    TCAtria1B is identified by a local directory containing both
+    ``hybrid_config.json`` and ``model.safetensors``.  The existing single-file
+    Qwen3 path is otherwise unchanged.
+    """
+    source_path = Path(source).expanduser()
+    if is_tcatria1b_directory(source_path):
+        cache_key = (
+            "text_encoder_tcatria1b",
+            _path_signature(str(source_path / "model.safetensors")),
+            _path_signature(str(source_path / "hybrid_config.json")),
+            str(device),
+            dtype,
+        )
+        if options.cache_components and not options.force_download:
+            cached = _cache_get(_COMPONENT_CACHE, cache_key)
+            if cached is not None:
+                cached.eval().requires_grad_(False)
+                cached.to(device=device, dtype=dtype)
+                return cached
+        text_encoder = TCAtria1BModel.from_pretrained(
+            source_path, dtype=dtype, device=device
+        )
+        if options.cache_components and not options.force_download:
+            _cache_put(
+                _COMPONENT_CACHE, cache_key, text_encoder,
+                max_items=_COMPONENT_CACHE_MAX_ITEMS,
+            )
+        return text_encoder
+
+    if source_path.is_dir():
+        raise ValueError(
+            f"Unsupported text encoder directory: {source_path}. "
+            "A TCAtria1B directory must contain hybrid_config.json and model.safetensors."
+        )
+
     file_path = resolve_single_file_path(
         source,
         options=options,
@@ -807,6 +853,7 @@ def build_anima_pipeline(
     device: str = "auto",
     dtype: str = "auto",
     text_encoder_dtype: str = "auto",
+    text_encoder_max_sequence_length: int | None = None,
     local_files_only: bool = False,
     cache_dir: str | None = None,
     force_download: bool = False,
@@ -872,11 +919,30 @@ def build_anima_pipeline(
         source=components.text_encoder_path or _TEXT_ENCODER_WEIGHTS,
         allow_remote_url=components.text_encoder_path is not None,
     )
+    is_tcatria = bool(
+        components.text_encoder_path
+        and is_tcatria1b_directory(Path(components.text_encoder_path).expanduser())
+    )
+    qwen_tokenizer_source = (
+        str(Path(components.text_encoder_path).expanduser())
+        if is_tcatria
+        else _QWEN_TOKENIZER_SOURCE
+    )
     prompt_tokenizer = load_prompt_tokenizer(
-        qwen_tokenizer_source=_QWEN_TOKENIZER_SOURCE,
+        qwen_tokenizer_source=qwen_tokenizer_source,
         t5_tokenizer_source=_T5_TOKENIZER_SOURCE,
         options=load_options,
     )
+
+    if text_encoder_max_sequence_length is None:
+        # Preserve the stock Anima 512-token behavior, while allowing TCAtria1B
+        # to use the 1024-token context it was calibrated with.  The T5 target
+        # side and final DiT conditioning remain capped at 512.
+        resolved_text_encoder_max_sequence_length = 1024 if is_tcatria else 512
+    else:
+        resolved_text_encoder_max_sequence_length = int(text_encoder_max_sequence_length)
+        if resolved_text_encoder_max_sequence_length < 1:
+            raise ValueError("text_encoder_max_sequence_length must be >= 1")
 
     resolved_scheduler = scheduler
     if resolved_scheduler is None:
@@ -897,6 +963,7 @@ def build_anima_pipeline(
         execution_device=resolved_device,
         model_dtype=resolved_dtype,
         text_encoder_dtype=resolved_text_encoder_dtype,
+        text_encoder_max_sequence_length=resolved_text_encoder_max_sequence_length,
         use_module_cpu_offload=False,
     )
     return runtime

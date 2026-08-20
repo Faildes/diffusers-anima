@@ -36,3 +36,4 @@ class AnimaRuntimeOptions:
     device: str = "auto"
     dtype: str = "auto"
     text_encoder_dtype: str = "auto"
+    text_encoder_max_sequence_length: int | None = None

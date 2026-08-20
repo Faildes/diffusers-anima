@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 import warnings
 
-from transformers import PreTrainedModel
 
 from diffusers import (
     AutoencoderKLQwenImage,
@@ -182,6 +181,8 @@ def _prepare_prompt_embedding_inputs(
             prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
+            source_max_length=pipe.text_encoder_max_sequence_length,
+            target_max_length=512,
         )
         if negative_prompt is None:
             return pos_hidden, pos_t5_ids, pos_t5_weights, None, None, None
@@ -191,6 +192,8 @@ def _prepare_prompt_embedding_inputs(
             negative_prompt,
             execution_device=pipe.execution_device,
             model_dtype=pipe.model_dtype,
+            source_max_length=pipe.text_encoder_max_sequence_length,
+            target_max_length=512,
         )
 
     return (
@@ -594,11 +597,12 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     transformer: AnimaTransformerModel
     vae: AutoencoderKLQwenImage
     scheduler: AnimaFlowMatchEulerDiscreteScheduler
-    text_encoder: PreTrainedModel
+    text_encoder: torch.nn.Module
     prompt_tokenizer: AnimaPromptTokenizer | None
     execution_device: str
     model_dtype: torch.dtype
     text_encoder_dtype: torch.dtype
+    text_encoder_max_sequence_length: int
     use_module_cpu_offload: bool
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     # prompt_tokenizer is intentionally NOT registered via register_modules because
@@ -614,11 +618,12 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         transformer: AnimaTransformerModel,
         vae: AutoencoderKLQwenImage,
         scheduler: FlowMatchEulerDiscreteScheduler,
-        text_encoder: PreTrainedModel,
+        text_encoder: torch.nn.Module,
         prompt_tokenizer: AnimaPromptTokenizer | None = None,
         execution_device: str = "auto",
         model_dtype: torch.dtype = torch.float32,
         text_encoder_dtype: torch.dtype = torch.float32,
+        text_encoder_max_sequence_length: int = 512,
         use_module_cpu_offload: bool = False,
     ):
         super().__init__()
@@ -638,9 +643,29 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.execution_device = execution_device
         self.model_dtype = model_dtype
         self.text_encoder_dtype = text_encoder_dtype
+        self.text_encoder_max_sequence_length = int(text_encoder_max_sequence_length)
         self.use_module_cpu_offload = use_module_cpu_offload
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
+
+    @property
+    def tokenizer(self):
+        """Primary source tokenizer (Qwen3 for stock Anima, Qwen3.5 for TCAtria1B)."""
+        return None if self.prompt_tokenizer is None else self.prompt_tokenizer.qwen_tokenizer
+
+    @property
+    def t5_tokenizer(self):
+        return None if self.prompt_tokenizer is None else self.prompt_tokenizer.t5_tokenizer
+
+    @property
+    def llm_adapter(self):
+        # Compatibility surface used by sd_embed's direct weighted-embedding path.
+        return getattr(self.transformer, "llm_adapter", None)
+
+    @property
+    def text_encoder_backend(self) -> str:
+        cfg = getattr(self.text_encoder, "config", None)
+        return "tcatria1b" if getattr(cfg, "model_type", None) == "tcatria1b" else "qwen3_06b"
 
     @property
     def execution_device(self) -> str:
@@ -1199,6 +1224,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             device=runtime_options.device,
             dtype=runtime_options.dtype,
             text_encoder_dtype=runtime_options.text_encoder_dtype,
+            text_encoder_max_sequence_length=runtime_options.text_encoder_max_sequence_length,
             local_files_only=load_options.local_files_only,
             cache_dir=load_options.cache_dir,
             force_download=load_options.force_download,
@@ -1253,7 +1279,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             key for key in kwargs if key in _ANIMA_COMPONENT_OVERRIDE_KEYS
         )
         custom_runtime_only = sorted(
-            key for key in kwargs if key in {"device", "dtype", "text_encoder_dtype"}
+            key for key in kwargs if key in {"device", "dtype", "text_encoder_dtype", "text_encoder_max_sequence_length"}
         )
         unsupported_custom = custom_single_file_only + custom_runtime_only
         if unsupported_custom:
@@ -1315,7 +1341,8 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """Load Anima from separate transformer, text encoder, and VAE files.
 
         ``model_path`` points to the Anima transformer checkpoint,
-        ``encoder_path`` points to the Qwen3-0.6B text encoder checkpoint, and
+        ``encoder_path`` points either to the Qwen3-0.6B text encoder checkpoint or
+        to a local TCAtria1B model directory, and
         ``vae_path`` points to the Anima VAE checkpoint. Each path accepts the
         same source forms as ``from_single_file``: a local file,
         ``repo_id::filename``, or a Hugging Face file URL.

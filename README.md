@@ -115,3 +115,46 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/api.md`](docs/api.md) | Full API reference (loading, generation, sampling config) |
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
+
+## TCAtria1B text encoder (Team-C)
+
+This fork can use **TCAtria1B** as the Anima text encoder without changing the
+Anima / Anima 2.9B transformer checkpoint format.
+
+A TCAtria1B directory is detected when it contains:
+
+```text
+TCAtria1B/
+├── hybrid_config.json
+├── model.safetensors
+├── tokenizer.json
+├── tokenizer_config.json
+└── vocab.json              # optional when tokenizer.json is complete
+```
+
+Use that directory as `encoder_path`:
+
+```python
+pipe = AnimaPipeline.from_multiple_files(
+    model_path="/workspace/anima_or_anima29b.safetensors",
+    encoder_path="/workspace/anima_hybrid_1b_understanding_work/02_understanding",
+    vae_path="/workspace/qwen_image_vae.safetensors",
+    torch_dtype=torch.bfloat16,
+    text_encoder_dtype="bf16",
+    text_encoder_max_sequence_length=1024,
+)
+```
+
+The same call supports both 28-block Anima and 40-block Anima 2.9B because the
+transformer depth is inferred independently from the text encoder. TCAtria1B
+emits 1024-wide hidden states, so the existing Anima LLM adapter remains
+unchanged.
+
+### Context handling
+
+For TCAtria1B, the loader defaults the source text encoder to 1024 tokens (the
+current calibration length). The T5 target side and final Anima conditioning
+remain 512 tokens. This lets the existing LLM adapter compress a longer
+TCAtria source sequence into Anima's native 512-token conditioning.
+
+Stock Qwen3-0.6B loading is unchanged and defaults to 512 source tokens.
