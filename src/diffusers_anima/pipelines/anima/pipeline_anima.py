@@ -1050,19 +1050,22 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.prompt_tokenizer.t5_query_strategy = normalized
         return self
 
-    def set_t5_query_max_length(self, max_length: int = 224) -> "AnimaPipeline":
-        """Set the stable adapter-query budget without capping Qwen source memory.
+    def set_t5_query_max_length(self, max_length: int | None = 0) -> "AnimaPipeline":
+        """Set an optional T5 query cap; 0/None preserves every query token.
 
-        This is deliberately separate from ``set_qwen_source_max_length``. The
-        full Qwen sequence remains available to every adapter cross-attention;
-        T5 IDs are only the bounded learned queries into that semantic memory.
+        v7 defaults to full-query preservation. Long target streams are paged
+        through the adapter/DiT in native-safe banks rather than selected,
+        truncated, merged, or position-compressed.
         """
         if self.prompt_tokenizer is None:
             raise RuntimeError("prompt_tokenizer is not initialised")
-        value = int(max_length)
-        if not 16 <= value <= 512:
-            raise ValueError("max_length must be in [16, 512]")
-        self.prompt_tokenizer.t5_query_max_length = value
+        if max_length in (None, 0):
+            self.prompt_tokenizer.t5_query_max_length = None
+        else:
+            value = int(max_length)
+            if value < 16:
+                raise ValueError("max_length must be >=16, or 0/None for full-query preservation")
+            self.prompt_tokenizer.t5_query_max_length = value
         return self
 
     def set_adapter_target_stability(
@@ -1212,7 +1215,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             "rms_max_ratio": float(adapter.long_context_rms_max_ratio),
             "full_source_coverage": int(adapter.long_context_router_top_k) == 0,
             "legacy_source_position_mode": str(adapter.source_position_mode),
-            "target_conditioning_length": 512,
+            "target_conditioning_length": "paged_full_query",
+            "target_page_size": int(getattr(self.transformer, "core_condition_page_size", 224)),
+            "full_target_coverage": True,
         }
 
     @property

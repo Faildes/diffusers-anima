@@ -26,7 +26,7 @@ import torch
 
 _QWEN3_DEFAULT_PAD_TOKEN_ID: int = 151643
 _CONDITIONING_MAX_LENGTH: int = 512
-_T5_DEFAULT_QUERY_MAX_LENGTH: int = 224
+_T5_DEFAULT_QUERY_MAX_LENGTH: int = 0
 _T5_QUERY_STRATEGIES = {"head", "uniform", "group_aware"}
 
 
@@ -136,7 +136,7 @@ class AnimaPromptTokenizer:
         *,
         qwen_source_max_length: int | None = None,
         t5_query_strategy: str = "group_aware",
-        t5_query_max_length: int = _T5_DEFAULT_QUERY_MAX_LENGTH,
+        t5_query_max_length: int | None = _T5_DEFAULT_QUERY_MAX_LENGTH,
     ) -> None:
         self.qwen_tokenizer = qwen_tokenizer
         self.t5_tokenizer = t5_tokenizer
@@ -148,9 +148,9 @@ class AnimaPromptTokenizer:
                 f"t5_query_strategy must be one of {sorted(_T5_QUERY_STRATEGIES)}, got {t5_query_strategy!r}"
             )
         self.t5_query_strategy = str(t5_query_strategy)
-        self.t5_query_max_length = int(t5_query_max_length)
-        if not 16 <= self.t5_query_max_length <= _CONDITIONING_MAX_LENGTH:
-            raise ValueError("t5_query_max_length must be in [16, 512]")
+        self.t5_query_max_length = None if t5_query_max_length in (None, 0) else int(t5_query_max_length)
+        if self.t5_query_max_length is not None and self.t5_query_max_length < 16:
+            raise ValueError("t5_query_max_length must be >=16, or 0/None for full-query preservation")
 
     def tokenize_with_weights(
         self, text: str
@@ -178,11 +178,16 @@ class AnimaPromptTokenizer:
             .input_ids[0]
             .tolist()
         )
-        t5_ids = _select_query_items(
-            [int(x) for x in t5_all_ids],
-            target=max(1, int(self.t5_query_max_length) - 1),
-            strategy=self.t5_query_strategy,
-        )
+        if self.t5_query_max_length is None:
+            # v7 full-query preservation: every T5 token becomes exactly one
+            # adapter query. No head/uniform/group-aware selection is applied.
+            t5_ids = [int(x) for x in t5_all_ids]
+        else:
+            t5_ids = _select_query_items(
+                [int(x) for x in t5_all_ids],
+                target=max(1, int(self.t5_query_max_length) - 1),
+                strategy=self.t5_query_strategy,
+            )
 
         qwen_pad = self.qwen_tokenizer.pad_token_id
         if qwen_pad is None:
@@ -199,9 +204,10 @@ class AnimaPromptTokenizer:
             t5_ids = [int(t5_eos)]
         elif int(t5_ids[-1]) != int(t5_eos):
             t5_ids = [*t5_ids, int(t5_eos)]
-        t5_ids = t5_ids[: int(self.t5_query_max_length)]
-        if t5_ids and int(t5_ids[-1]) != int(t5_eos):
-            t5_ids[-1] = int(t5_eos)
+        if self.t5_query_max_length is not None:
+            t5_ids = t5_ids[: int(self.t5_query_max_length)]
+            if t5_ids and int(t5_ids[-1]) != int(t5_eos):
+                t5_ids[-1] = int(t5_eos)
 
         qwen_pairs = [[(int(token_id), 1.0) for token_id in qwen_ids]]
         return {
@@ -297,10 +303,6 @@ def prepare_condition_inputs(
         if len(t5_token_ids) == 0:
             t5_token_ids = [1]
             t5_token_weights = [1.0]
-        if len(t5_token_ids) > _CONDITIONING_MAX_LENGTH:
-            raise RuntimeError(
-                f"T5 target/query length exceeded {_CONDITIONING_MAX_LENGTH}: {len(t5_token_ids)}"
-            )
 
         qwen_token_batches.append(qwen_token_ids)
         t5_token_batches.append(t5_token_ids)
@@ -376,11 +378,9 @@ def build_condition(
             source_attention_mask=qwen_mask,
             target_attention_mask=t5_mask,
         )
-    # Target-side contract is always 512 regardless of Qwen source length.
-    cond = cond[:, :_CONDITIONING_MAX_LENGTH]
-    pad_len = max(0, _CONDITIONING_MAX_LENGTH - cond.shape[1])
-    if pad_len > 0:
-        cond = torch.nn.functional.pad(cond, (0, 0, 0, pad_len))
+    # v7: preserve every target/query token. The transformer pages the resulting
+    # conditioning through native-safe DiT banks; no query is truncated, merged,
+    # uniformly sampled, or compressed here.
     return cond
 
 
@@ -654,31 +654,33 @@ def prepare_condition_inputs_from_plans(
             add_eos=False,
             query_strategy="head",
         )
-        t_content_budget = max(1, int(prompt_tokenizer.t5_query_max_length) - 1)
-        if len(t_all_ids) > t_content_budget:
-            if prompt_tokenizer.t5_query_strategy == "head":
-                t_selected = list(range(t_content_budget))
-            elif prompt_tokenizer.t5_query_strategy == "uniform":
-                t_selected = _uniform_indices(len(t_all_ids), t_content_budget)
-            else:
-                t_selected = _select_group_aware_query_indices(
-                    t_all_offsets,
-                    plan.spans,
-                    target=t_content_budget,
-                    subject_group_ids=getattr(plan, "metadata", {}).get("subject_group_ids", ()),
-                )
-            t_ids = [t_all_ids[i] for i in t_selected]
-            t_offsets = [t_all_offsets[i] for i in t_selected]
-        else:
+        if prompt_tokenizer.t5_query_max_length is None:
             t_ids = list(t_all_ids)
             t_offsets = list(t_all_offsets)
+        else:
+            t_content_budget = max(1, int(prompt_tokenizer.t5_query_max_length) - 1)
+            if len(t_all_ids) > t_content_budget:
+                if prompt_tokenizer.t5_query_strategy == "head":
+                    t_selected = list(range(t_content_budget))
+                elif prompt_tokenizer.t5_query_strategy == "uniform":
+                    t_selected = _uniform_indices(len(t_all_ids), t_content_budget)
+                else:
+                    t_selected = _select_group_aware_query_indices(
+                        t_all_offsets, plan.spans, target=t_content_budget,
+                        subject_group_ids=getattr(plan, "metadata", {}).get("subject_group_ids", ()),
+                    )
+                t_ids = [t_all_ids[i] for i in t_selected]
+                t_offsets = [t_all_offsets[i] for i in t_selected]
+            else:
+                t_ids = list(t_all_ids)
+                t_offsets = list(t_all_offsets)
         t5_eos = prompt_tokenizer.t5_tokenizer.eos_token_id
         if t5_eos is None:
             t5_eos = 1
         if not t_ids or int(t_ids[-1]) != int(t5_eos):
             t_ids.append(int(t5_eos))
             t_offsets.append((len(plan.text), len(plan.text)))
-        if len(t_ids) > int(prompt_tokenizer.t5_query_max_length):
+        if prompt_tokenizer.t5_query_max_length is not None and len(t_ids) > int(prompt_tokenizer.t5_query_max_length):
             t_ids = t_ids[: int(prompt_tokenizer.t5_query_max_length)]
             t_offsets = t_offsets[: int(prompt_tokenizer.t5_query_max_length)]
             t_ids[-1] = int(t5_eos)

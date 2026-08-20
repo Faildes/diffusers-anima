@@ -530,6 +530,28 @@ class _LLMAdapter(nn.Module):
         target_attention_mask: torch.Tensor | None = None,
         source_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # v7 full-query preservation: 224 is a *page size*, never a cap.
+        # Every T5 query is processed exactly once. Each page receives the full
+        # Qwen source memory, so cross-page semantics remain available through
+        # the source encoder while target self-attention stays in the empirically
+        # stable occupancy regime. No overlap, top-k, averaging, or token merge
+        # happens at the adapter stage.
+        page_size = max(16, int(self.target_stability_reference_length))
+        if int(target_input_ids.shape[1]) > page_size:
+            pages: list[torch.Tensor] = []
+            for start in range(0, int(target_input_ids.shape[1]), page_size):
+                end = min(int(target_input_ids.shape[1]), start + page_size)
+                page_mask = None if target_attention_mask is None else target_attention_mask[:, start:end]
+                pages.append(
+                    self.forward(
+                        source_hidden_states,
+                        target_input_ids[:, start:end],
+                        target_attention_mask=page_mask,
+                        source_attention_mask=source_attention_mask,
+                    )
+                )
+            return torch.cat(pages, dim=1)
+
         normalized_target_mask = _expand_attention_mask(target_attention_mask)
         normalized_source_mask = _expand_attention_mask(source_attention_mask)
 
@@ -681,6 +703,10 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             layers=adapter_layers,
             heads=adapter_heads,
         )
+        # v7: DiT conditioning is paged too. 224 is not a content limit;
+        # every page is padded to the original 512-slot Anima contract and every
+        # page contributes to the denoiser result.
+        self.core_condition_page_size = 224
 
     def preprocess_text_embeds(
         self,
@@ -693,14 +719,8 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if text_ids is None:
             return text_embeds
 
-        # Qwen source memory may be longer than 512.  Only the T5/query/output
-        # side is constrained to Anima's trained 512-position contract.
-        if text_ids.shape[1] > 512:
-            text_ids = text_ids[:, :512]
-            if t5xxl_weights is not None:
-                t5xxl_weights = t5xxl_weights[:, :512]
-            if target_attention_mask is not None:
-                target_attention_mask = target_attention_mask[:, :512]
+        # v7: keep the complete T5 query stream. The adapter itself pages target
+        # queries into native-safe banks and returns them in original order.
         adapted = self.llm_adapter(
             text_embeds,
             text_ids,
@@ -709,8 +729,7 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         )
         if t5xxl_weights is not None:
             adapted = adapted * t5xxl_weights
-        adapted = adapted[:, :512]
-        return _pad_to_length(adapted, 512)
+        return adapted
 
     def forward(
         self,
@@ -732,13 +751,35 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # CosmosTransformer3DModel internally repeats this per batch, so keep batch=1 here.
             padding_mask = _default_padding_mask(hidden_states)
 
-        sample = self.core(
-            hidden_states=hidden_states,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            padding_mask=padding_mask,
-            return_dict=False,
-        )[0]
+        # v7 full-preservation DiT paging. Each conditioning token appears in
+        # exactly one page. Pages are zero-padded to 512 so every core invocation
+        # stays in the distribution the original Anima DiT was trained on.
+        # Denoiser outputs are combined by the number of active conditioning
+        # tokens in each page, preventing either short tail pages or long prompts
+        # from changing aggregate conditioning energy merely because of length.
+        page_size = max(16, int(getattr(self, "core_condition_page_size", 224)))
+        condition_length = int(encoder_hidden_states.shape[1])
+        weighted_sample = None
+        total_weight = None
+        for start in range(0, max(1, condition_length), page_size):
+            end = min(condition_length, start + page_size)
+            page = encoder_hidden_states[:, start:end]
+            if page.shape[1] == 0:
+                page = encoder_hidden_states[:, :1]
+            active = page.float().abs().sum(dim=-1).gt(1e-8).sum(dim=-1).to(torch.float32)
+            page = _pad_to_length(page, 512)
+            page_sample = self.core(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=page,
+                padding_mask=padding_mask,
+                return_dict=False,
+            )[0]
+            view_shape = [page_sample.shape[0]] + [1] * (page_sample.ndim - 1)
+            weight = active.to(device=page_sample.device).view(*view_shape)
+            weighted_sample = page_sample.float() * weight if weighted_sample is None else weighted_sample + page_sample.float() * weight
+            total_weight = weight if total_weight is None else total_weight + weight
+        sample = (weighted_sample / total_weight.clamp_min(1.0)).to(dtype=hidden_states.dtype)
 
         if not return_dict:
             return (sample,)
