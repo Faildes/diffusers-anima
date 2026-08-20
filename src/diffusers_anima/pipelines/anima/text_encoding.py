@@ -1,10 +1,11 @@
 """Anima prompt tokenization and text conditioning utilities.
 
-The Qwen source-memory length and Anima target-conditioning length are
-intentionally separate.  Qwen may read a long prompt while the existing Anima
-LLM adapter keeps its 512-position T5/query side.  Alternate Qwen families can
-be representation-aligned with :class:`AnimaTextEncoderBridge` before entering
-the adapter.
+The Qwen source-memory and T5 target-query streams are both preserved in full.
+Long T5 prompts use the original single-pass Anima adapter topology; runtime
+stability is provided by zero-valued attention/conditioning null sinks rather
+than query selection, truncation, merging, or paging. Alternate Qwen families
+can be representation-aligned with :class:`AnimaTextEncoderBridge` before
+entering the adapter.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
 import torch
 
 _QWEN3_DEFAULT_PAD_TOKEN_ID: int = 151643
-_CONDITIONING_MAX_LENGTH: int = 512
 _T5_DEFAULT_QUERY_MAX_LENGTH: int = 0
 _T5_QUERY_STRATEGIES = {"head", "uniform", "group_aware"}
 
@@ -124,9 +124,9 @@ class AnimaPromptTokenizer:
 
     ``qwen_source_max_length=None`` means the Qwen source is not truncated by
     Anima.  This is deliberate: the source encoder acts as semantic memory.
-    The T5/query side uses a conservative 224-query budget by default because
-    dense ~256..512 target occupancy is empirically unstable in stock Anima.
-    Qwen source memory remains independent and may be arbitrarily longer.
+    The T5/query side is uncapped by default. Every tokenizer output token is
+    retained and passed through one ordered adapter stream; the transformer
+    stabilises long-query occupancy with semantic-free null sinks.
     """
 
     def __init__(
@@ -164,10 +164,9 @@ class AnimaPromptTokenizer:
             qwen_kwargs["max_length"] = int(self.qwen_source_max_length)
         qwen_ids = self.qwen_tokenizer([text], **qwen_kwargs).input_ids[0].tolist()
 
-        # The adapter target/query side is fixed at 512 positions, but do not
-        # blindly drop the tail of a long prompt.  Tokenize the full T5 stream
-        # and, when needed, choose query anchors spanning the complete text.
-        # Qwen still carries every source token; T5 is only the bounded query set.
+        # v8 follows the initial Anima tokenizer behaviour: tokenize the entire
+        # T5 stream first.  With the default unlimited query policy no token is
+        # selected, sampled, merged, or tail-truncated.
         t5_all_ids = (
             self.t5_tokenizer(
                 [text],
@@ -179,7 +178,7 @@ class AnimaPromptTokenizer:
             .tolist()
         )
         if self.t5_query_max_length is None:
-            # v7 full-query preservation: every T5 token becomes exactly one
+            # v8 full-stream default: every T5 token becomes exactly one
             # adapter query. No head/uniform/group-aware selection is applied.
             t5_ids = [int(x) for x in t5_all_ids]
         else:
@@ -369,7 +368,7 @@ def build_condition(
     t5_mask: torch.Tensor | None,
     t5_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the existing Anima LLM adapter with long source / 512 target."""
+    """Run one full T5 stream through the Anima LLM adapter."""
     with torch.inference_mode():
         cond = transformer.preprocess_text_embeds(
             qwen_hidden,
@@ -378,9 +377,8 @@ def build_condition(
             source_attention_mask=qwen_mask,
             target_attention_mask=t5_mask,
         )
-    # v7: preserve every target/query token. The transformer pages the resulting
-    # conditioning through native-safe DiT banks; no query is truncated, merged,
-    # uniformly sampled, or compressed here.
+    # v8: preserve every target/query token. The transformer uses one adapter
+    # pass and one DiT pass; only zero-valued null rows may be appended.
     return cond
 
 
@@ -447,11 +445,6 @@ def _tokenize_with_offsets(
         if not ids or int(ids[-1]) != int(eos):
             ids.append(int(eos))
             offsets.append((len(text), len(text)))
-        if len(ids) > _CONDITIONING_MAX_LENGTH:
-            ids = ids[:_CONDITIONING_MAX_LENGTH]
-            offsets = offsets[:_CONDITIONING_MAX_LENGTH]
-            ids[-1] = int(eos)
-            offsets[-1] = (len(text), len(text))
     return ids, offsets
 
 

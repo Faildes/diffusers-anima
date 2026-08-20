@@ -392,6 +392,7 @@ class _AdapterAttention(nn.Module):
         pos_k: tuple[torch.Tensor, torch.Tensor] | None = None,
         long_context_options: dict[str, Any] | None = None,
         rope: _RotaryEmbedding | None = None,
+        null_key_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         context = x if context is None else context
 
@@ -424,6 +425,48 @@ class _AdapterAttention(nn.Module):
             k, v = self._project_key_value(context)
             if pos_k is not None:
                 k = _apply_rope(k, *pos_k)
+
+            # v8 target-stability sink.  The original Anima path sends a short
+            # T5 query sequence through the adapter and only then zero-pads the
+            # result for the DiT.  Long dense query streams remove that null
+            # competition and become progressively over-conditioned.  For
+            # target self-attention only, append *projected zero K/V entries*
+            # to the softmax denominator. They have no semantic value and no
+            # output position, so every real T5 query is retained exactly once.
+            if null_key_counts is not None:
+                counts = null_key_counts.to(device=k.device, dtype=torch.long).reshape(-1)
+                if counts.numel() == 1 and k.shape[0] != 1:
+                    counts = counts.expand(k.shape[0])
+                if counts.numel() != k.shape[0]:
+                    raise ValueError(
+                        f"null_key_counts batch mismatch: {counts.numel()} vs {k.shape[0]}"
+                    )
+                max_null = int(counts.max().item()) if counts.numel() else 0
+                if max_null > 0:
+                    null_k = torch.zeros(
+                        (k.shape[0], k.shape[1], max_null, k.shape[-1]),
+                        device=k.device, dtype=k.dtype,
+                    )
+                    null_v = torch.zeros(
+                        (v.shape[0], v.shape[1], max_null, v.shape[-1]),
+                        device=v.device, dtype=v.dtype,
+                    )
+                    k = torch.cat([k, null_k], dim=-2)
+                    v = torch.cat([v, null_v], dim=-2)
+
+                    null_mask = (
+                        torch.arange(max_null, device=k.device, dtype=torch.long).view(1, 1, 1, -1)
+                        < counts.view(-1, 1, 1, 1)
+                    )
+                    if attn_mask is None:
+                        real_mask = torch.ones(
+                            (k.shape[0], 1, 1, k.shape[-2] - max_null),
+                            device=k.device, dtype=torch.bool,
+                        )
+                    else:
+                        real_mask = attn_mask.to(device=k.device, dtype=torch.bool)
+                    attn_mask = torch.cat([real_mask, null_mask], dim=-1)
+
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         y = y.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1).contiguous()
@@ -454,7 +497,7 @@ class _AdapterBlock(nn.Module):
         pos_target: tuple[torch.Tensor, torch.Tensor],
         pos_source: tuple[torch.Tensor, torch.Tensor] | None,
         long_context_options: dict[str, Any] | None = None,
-        target_long_context_options: dict[str, Any] | None = None,
+        target_null_key_counts: torch.Tensor | None = None,
         rope: _RotaryEmbedding | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(
@@ -462,8 +505,7 @@ class _AdapterBlock(nn.Module):
             attn_mask=target_mask,
             pos_q=pos_target,
             pos_k=pos_target,
-            long_context_options=target_long_context_options,
-            rope=rope,
+            null_key_counts=target_null_key_counts,
         )
         x = x + self.cross_attn(
             self.norm_cross_attn(x),
@@ -511,17 +553,88 @@ class _LLMAdapter(nn.Module):
         self.long_context_rms_min_ratio = 0.92
         self.long_context_rms_max_ratio = 1.08
 
-        # v6 target/query stability. Empirical Anima checkpoints start drifting
-        # as active T5 queries approach ~256 and can collapse near 512. Keep the
-        # normal tokenizer below that regime (224), and defensively page any
-        # externally supplied denser target sequence without dropping a query.
-        self.target_stability_reference_length = 224
-        self.target_long_context_mode = "windowed"
-        self.target_long_context_window_size = 192
-        self.target_long_context_overlap = 32
-        self.target_long_context_router_floor = 0.02
-        self.target_density_power = 0.50
-        self.target_density_min_scale = 0.70
+        # v8 full-T5 single-pass stability.  No T5 query is selected, merged,
+        # truncated, position-compressed, or paged.  Instead, when the active
+        # query count leaves the empirically safe range, target self-attention
+        # receives zero-valued K/V sink entries so its softmax competition does
+        # not become progressively denser. The real query sequence/order stays
+        # byte-for-byte aligned with the T5 tokenizer output.
+        self.target_null_stability_enabled = True
+        self.target_stability_start_length = 224
+        self.target_stability_full_length = 384
+        self.target_reference_active = 224
+        self.target_reference_total = 512
+
+    def _target_active_counts(
+        self,
+        target_attention_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        target_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if target_attention_mask is None:
+            return torch.full(
+                (batch_size,), float(target_length), device=device, dtype=torch.float32
+            )
+        return target_attention_mask.to(device=device, dtype=torch.float32).sum(dim=-1).clamp_min(1.0)
+
+    def _target_stability_strength(self, active: torch.Tensor) -> torch.Tensor:
+        if not bool(self.target_null_stability_enabled):
+            return torch.zeros_like(active, dtype=torch.float32)
+        start = float(max(1, int(self.target_stability_start_length)))
+        full = float(max(int(self.target_stability_full_length), int(self.target_stability_start_length) + 1))
+        return ((active.float() - start) / (full - start)).clamp(0.0, 1.0)
+
+    def target_null_key_counts(
+        self,
+        target_attention_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        target_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        active = self._target_active_counts(
+            target_attention_mask,
+            batch_size=batch_size,
+            target_length=target_length,
+            device=device,
+        )
+        strength = self._target_stability_strength(active)
+        ref_active = float(max(1, int(self.target_reference_active)))
+        ref_total = float(max(int(self.target_reference_total), int(self.target_reference_active)))
+        null_ratio = max(0.0, (ref_total / ref_active) - 1.0)
+        full_null = torch.ceil(active * null_ratio)
+        return torch.round(full_null * strength).to(dtype=torch.long)
+
+    def stable_condition_length(
+        self,
+        target_attention_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        target_length: int,
+        device: torch.device,
+    ) -> int:
+        """Return a zero-padding length that preserves native null-slot density.
+
+        This is not a T5 cap. ``target_length`` real queries are always kept.
+        Only zero conditioning rows are appended after the adapter.
+        """
+        active = self._target_active_counts(
+            target_attention_mask,
+            batch_size=batch_size,
+            target_length=target_length,
+            device=device,
+        )
+        strength = self._target_stability_strength(active)
+        ref_active = float(max(1, int(self.target_reference_active)))
+        ref_total = float(max(int(self.target_reference_total), int(self.target_reference_active)))
+        reference_ratio = min(1.0, ref_active / ref_total)
+        full_total = torch.ceil(active / max(reference_ratio, 1e-6))
+        native_total = torch.full_like(full_total, float(max(512, target_length)))
+        desired = torch.ceil(native_total + strength * (full_total - native_total).clamp_min(0.0))
+        desired = torch.maximum(desired, torch.full_like(desired, float(target_length)))
+        return max(512, target_length, int(desired.max().item()))
 
     def forward(
         self,
@@ -530,42 +643,19 @@ class _LLMAdapter(nn.Module):
         target_attention_mask: torch.Tensor | None = None,
         source_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # v7 full-query preservation: 224 is a *page size*, never a cap.
-        # Every T5 query is processed exactly once. Each page receives the full
-        # Qwen source memory, so cross-page semantics remain available through
-        # the source encoder while target self-attention stays in the empirically
-        # stable occupancy regime. No overlap, top-k, averaging, or token merge
-        # happens at the adapter stage.
-        page_size = max(16, int(self.target_stability_reference_length))
-        if int(target_input_ids.shape[1]) > page_size:
-            pages: list[torch.Tensor] = []
-            for start in range(0, int(target_input_ids.shape[1]), page_size):
-                end = min(int(target_input_ids.shape[1]), start + page_size)
-                page_mask = None if target_attention_mask is None else target_attention_mask[:, start:end]
-                pages.append(
-                    self.forward(
-                        source_hidden_states,
-                        target_input_ids[:, start:end],
-                        target_attention_mask=page_mask,
-                        source_attention_mask=source_attention_mask,
-                    )
-                )
-            return torch.cat(pages, dim=1)
-
+        # v8 restores the original Anima T5 topology: one complete target
+        # sequence, one six-block LLM-adapter pass, one ordered output stream.
+        # There is deliberately no target paging or target position compression.
         normalized_target_mask = _expand_attention_mask(target_attention_mask)
         normalized_source_mask = _expand_attention_mask(source_attention_mask)
 
         target_hidden_states = self.embed(target_input_ids)
         source_context = source_hidden_states
 
-        # Keep target/query RoPE inside the empirically stable native regime.
-        # Every query remains present; only adapter-side coordinates are
-        # continuously compressed when an external caller supplies >reference.
-        target_position_ids = _build_source_position_ids(
+        target_position_ids = _build_position_ids(
             batch_size=target_hidden_states.shape[0],
             length=target_hidden_states.shape[1],
             device=target_hidden_states.device,
-            trained_length=max(2, int(self.target_stability_reference_length)),
         )
         use_windowed_long_context = (
             self.long_context_mode == "windowed"
@@ -573,8 +663,6 @@ class _LLMAdapter(nn.Module):
         )
         source_position_embed: tuple[torch.Tensor, torch.Tensor] | None
         if use_windowed_long_context:
-            # Every source bank receives native local 0..window-1 RoPE inside
-            # `_AdapterAttention`; do not pre-compress the complete sequence.
             source_position_embed = None
         else:
             if self.source_position_mode == "raw":
@@ -605,24 +693,12 @@ class _LLMAdapter(nn.Module):
             "rms_min_ratio": float(self.long_context_rms_min_ratio),
             "rms_max_ratio": float(self.long_context_rms_max_ratio),
         }
-        target_long_context_options = {
-            "enabled": (
-                self.target_long_context_mode == "windowed"
-                and int(target_hidden_states.shape[1]) > int(self.target_stability_reference_length)
-            ),
-            "threshold": int(self.target_stability_reference_length),
-            "window_size": min(
-                int(self.target_long_context_window_size),
-                int(self.target_stability_reference_length),
-            ),
-            "overlap": int(self.target_long_context_overlap),
-            "router_top_k": 0,
-            "router_temperature": 1.0,
-            "locality_strength": 0.35,
-            "router_floor": float(self.target_long_context_router_floor),
-            "rms_min_ratio": 0.94,
-            "rms_max_ratio": 1.06,
-        }
+        target_null_counts = self.target_null_key_counts(
+            target_attention_mask,
+            batch_size=target_hidden_states.shape[0],
+            target_length=target_hidden_states.shape[1],
+            device=target_hidden_states.device,
+        )
 
         hidden_states = target_hidden_states
         for block in self.blocks:
@@ -634,29 +710,15 @@ class _LLMAdapter(nn.Module):
                 pos_target=target_position_embed,
                 pos_source=source_position_embed,
                 long_context_options=long_context_options,
-                target_long_context_options=target_long_context_options,
+                target_null_key_counts=target_null_counts,
                 rope=self.rope,
             )
         output = self.norm(self.out_proj(hidden_states))
-
-        # Density guard for callers that bypass AnimaPromptTokenizer.  This does
-        # not remove or merge any target/source token; it only prevents the
-        # aggregate conditioning energy from growing with active query count.
-        if target_attention_mask is None:
-            active = torch.full(
-                (output.shape[0], 1, 1),
-                float(output.shape[1]),
-                device=output.device,
-                dtype=torch.float32,
-            )
-        else:
-            active = target_attention_mask.to(device=output.device, dtype=torch.float32).sum(dim=-1)
-            active = active.reshape(output.shape[0], 1, 1).clamp_min(1.0)
-        reference = float(max(1, int(self.target_stability_reference_length)))
-        ratio = torch.clamp(reference / active, max=1.0)
-        scale = ratio.pow(max(0.0, float(self.target_density_power)))
-        scale = scale.clamp(min=max(0.0, min(1.0, float(self.target_density_min_scale))), max=1.0)
-        return output * scale.to(dtype=output.dtype)
+        if target_attention_mask is not None:
+            output = output * target_attention_mask.to(
+                device=output.device, dtype=output.dtype
+            ).unsqueeze(-1)
+        return output
 
 
 class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
@@ -703,10 +765,10 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             layers=adapter_layers,
             heads=adapter_heads,
         )
-        # v7: DiT conditioning is paged too. 224 is not a content limit;
-        # every page is padded to the original 512-slot Anima contract and every
-        # page contributes to the denoiser result.
-        self.core_condition_page_size = 224
+        # v8 marker used by sd_embed / runtime diagnostics. The DiT receives one
+        # full conditioning stream; zero null slots are appended only to retain
+        # the original Anima occupancy statistics.
+        self.t5_single_pass_full_stream = True
 
     def preprocess_text_embeds(
         self,
@@ -719,8 +781,10 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if text_ids is None:
             return text_embeds
 
-        # v7: keep the complete T5 query stream. The adapter itself pages target
-        # queries into native-safe banks and returns them in original order.
+        # v8 keeps the initial Anima single-pass T5 topology while preserving
+        # every query token. Stability is achieved with null attention sinks
+        # inside the adapter plus zero-only occupancy padding after it; neither
+        # operation selects, merges, averages, or rewrites semantic queries.
         adapted = self.llm_adapter(
             text_embeds,
             text_ids,
@@ -729,7 +793,17 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         )
         if t5xxl_weights is not None:
             adapted = adapted * t5xxl_weights
-        return adapted
+        if target_attention_mask is not None:
+            adapted = adapted * target_attention_mask.to(
+                device=adapted.device, dtype=adapted.dtype
+            ).unsqueeze(-1)
+        stable_length = self.llm_adapter.stable_condition_length(
+            target_attention_mask,
+            batch_size=adapted.shape[0],
+            target_length=adapted.shape[1],
+            device=adapted.device,
+        )
+        return _pad_to_length(adapted, stable_length)
 
     def forward(
         self,
@@ -751,35 +825,16 @@ class AnimaTransformerModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # CosmosTransformer3DModel internally repeats this per batch, so keep batch=1 here.
             padding_mask = _default_padding_mask(hidden_states)
 
-        # v7 full-preservation DiT paging. Each conditioning token appears in
-        # exactly one page. Pages are zero-padded to 512 so every core invocation
-        # stays in the distribution the original Anima DiT was trained on.
-        # Denoiser outputs are combined by the number of active conditioning
-        # tokens in each page, preventing either short tail pages or long prompts
-        # from changing aggregate conditioning energy merely because of length.
-        page_size = max(16, int(getattr(self, "core_condition_page_size", 224)))
-        condition_length = int(encoder_hidden_states.shape[1])
-        weighted_sample = None
-        total_weight = None
-        for start in range(0, max(1, condition_length), page_size):
-            end = min(condition_length, start + page_size)
-            page = encoder_hidden_states[:, start:end]
-            if page.shape[1] == 0:
-                page = encoder_hidden_states[:, :1]
-            active = page.float().abs().sum(dim=-1).gt(1e-8).sum(dim=-1).to(torch.float32)
-            page = _pad_to_length(page, 512)
-            page_sample = self.core(
-                hidden_states=hidden_states,
-                timestep=timestep,
-                encoder_hidden_states=page,
-                padding_mask=padding_mask,
-                return_dict=False,
-            )[0]
-            view_shape = [page_sample.shape[0]] + [1] * (page_sample.ndim - 1)
-            weight = active.to(device=page_sample.device).view(*view_shape)
-            weighted_sample = page_sample.float() * weight if weighted_sample is None else weighted_sample + page_sample.float() * weight
-            total_weight = weight if total_weight is None else total_weight + weight
-        sample = (weighted_sample / total_weight.clamp_min(1.0)).to(dtype=hidden_states.dtype)
+        # v8: one DiT call for the complete ordered conditioning stream. The
+        # appended rows are exact zeros and only recreate the null-slot density
+        # that short prompts had in the original 512-slot Anima implementation.
+        sample = self.core(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            padding_mask=padding_mask,
+            return_dict=False,
+        )[0]
 
         if not return_dict:
             return (sample,)

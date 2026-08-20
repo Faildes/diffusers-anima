@@ -597,9 +597,13 @@ def _generate_image(
         pos_cond = pos_cond.to(device=pipe.execution_device, dtype=pipe.model_dtype)
         if neg_cond is not None:
             neg_cond = neg_cond.to(device=pipe.execution_device, dtype=pipe.model_dtype)
+            if effective_cfg_batch_mode == "concat" and pos_cond.shape[1:] != neg_cond.shape[1:]:
+                # v8 keeps each branch at its own occupancy-stable null length.
+                # Padding the shorter CFG branch up to the longer branch would
+                # change its null-token ratio and therefore guidance strength.
+                effective_cfg_batch_mode = "split"
             if effective_cfg_batch_mode == "concat":
-                # Precompute the static CFG conditioning batch once. The previous
-                # path rebuilt this concatenation at every denoising step.
+                # Precompute the static CFG conditioning batch once.
                 pos_cond = torch.cat([pos_cond, neg_cond], dim=0)
                 neg_cond = None
 
@@ -1053,9 +1057,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     def set_t5_query_max_length(self, max_length: int | None = 0) -> "AnimaPipeline":
         """Set an optional T5 query cap; 0/None preserves every query token.
 
-        v7 defaults to full-query preservation. Long target streams are paged
-        through the adapter/DiT in native-safe banks rather than selected,
-        truncated, merged, or position-compressed.
+        v8 defaults to the initial Anima-style single T5 stream. Long targets
+        remain one ordered sequence; stability comes from semantic-free null
+        attention/conditioning slots rather than token selection or paging.
         """
         if self.prompt_tokenizer is None:
             raise RuntimeError("prompt_tokenizer is not initialised")
@@ -1071,47 +1075,41 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     def set_adapter_target_stability(
         self,
         *,
-        reference_length: int | None = None,
-        mode: str | None = None,
-        window_size: int | None = None,
-        overlap: int | None = None,
-        router_floor: float | None = None,
-        density_power: float | None = None,
-        density_min_scale: float | None = None,
+        enabled: bool | None = None,
+        start_length: int | None = None,
+        full_length: int | None = None,
+        reference_active: int | None = None,
+        reference_total: int | None = None,
     ) -> "AnimaPipeline":
-        """Configure v6 no-pruning target/query stability for direct callers."""
+        """Configure v8 full-T5 single-pass null-occupancy stability.
+
+        These values never cap the prompt. ``reference_active/reference_total``
+        defines the native active/null density that is approached after
+        ``full_length``. All real T5 queries remain present and ordered.
+        """
         adapter = self.transformer.llm_adapter
-        if reference_length is not None:
-            if not 16 <= int(reference_length) <= 512:
-                raise ValueError("reference_length must be in [16, 512]")
-            adapter.target_stability_reference_length = int(reference_length)
-        if mode is not None:
-            normalized = str(mode).strip().lower()
-            if normalized not in {"windowed", "legacy"}:
-                raise ValueError("mode must be 'windowed' or 'legacy'")
-            adapter.target_long_context_mode = normalized
-        if window_size is not None:
-            if not 16 <= int(window_size) <= 512:
-                raise ValueError("window_size must be in [16, 512]")
-            adapter.target_long_context_window_size = int(window_size)
-        if overlap is not None:
-            if int(overlap) < 0:
-                raise ValueError("overlap must be >= 0")
-            adapter.target_long_context_overlap = int(overlap)
-        if int(adapter.target_long_context_overlap) >= int(adapter.target_long_context_window_size):
-            raise ValueError("target overlap must be smaller than target window_size")
-        if router_floor is not None:
-            if not 0.0 <= float(router_floor) <= 1.0:
-                raise ValueError("router_floor must be in [0, 1]")
-            adapter.target_long_context_router_floor = float(router_floor)
-        if density_power is not None:
-            if float(density_power) < 0.0:
-                raise ValueError("density_power must be >= 0")
-            adapter.target_density_power = float(density_power)
-        if density_min_scale is not None:
-            if not 0.0 < float(density_min_scale) <= 1.0:
-                raise ValueError("density_min_scale must be in (0, 1]")
-            adapter.target_density_min_scale = float(density_min_scale)
+        if enabled is not None:
+            adapter.target_null_stability_enabled = bool(enabled)
+        if start_length is not None:
+            if int(start_length) < 16:
+                raise ValueError("start_length must be >= 16")
+            adapter.target_stability_start_length = int(start_length)
+        if full_length is not None:
+            if int(full_length) <= int(adapter.target_stability_start_length):
+                raise ValueError("full_length must be greater than start_length")
+            adapter.target_stability_full_length = int(full_length)
+        if reference_active is not None:
+            if int(reference_active) < 1:
+                raise ValueError("reference_active must be >= 1")
+            adapter.target_reference_active = int(reference_active)
+        if reference_total is not None:
+            if int(reference_total) < int(adapter.target_reference_active):
+                raise ValueError("reference_total must be >= reference_active")
+            adapter.target_reference_total = int(reference_total)
+        if int(adapter.target_stability_full_length) <= int(adapter.target_stability_start_length):
+            raise ValueError("full_length must be greater than start_length")
+        if int(adapter.target_reference_total) < int(adapter.target_reference_active):
+            raise ValueError("reference_total must be >= reference_active")
         return self
 
     def set_adapter_source_position_mode(self, mode: str) -> "AnimaPipeline":
@@ -1215,9 +1213,14 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             "rms_max_ratio": float(adapter.long_context_rms_max_ratio),
             "full_source_coverage": int(adapter.long_context_router_top_k) == 0,
             "legacy_source_position_mode": str(adapter.source_position_mode),
-            "target_conditioning_length": "paged_full_query",
-            "target_page_size": int(getattr(self.transformer, "core_condition_page_size", 224)),
+            "target_conditioning_length": "single_pass_full_query_null_stabilized",
+            "target_null_stability_enabled": bool(adapter.target_null_stability_enabled),
+            "target_stability_start_length": int(adapter.target_stability_start_length),
+            "target_stability_full_length": int(adapter.target_stability_full_length),
+            "target_reference_active": int(adapter.target_reference_active),
+            "target_reference_total": int(adapter.target_reference_total),
             "full_target_coverage": True,
+            "target_paging": False,
         }
 
     @property
