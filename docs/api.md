@@ -73,7 +73,8 @@ pipe(
     num_images_per_prompt: int = 1,
     guidance_scale: float = 4.0,
     generator: torch.Generator | list[torch.Generator] | None = None,
-    cfg_batch_mode: str = "split",
+    cfg_batch_mode: str = "auto",
+    sample_dtype: str | torch.dtype = "auto",
     output_type: str = "pil",
     return_dict: bool = True,
     callback_on_step_end: Callable | None = None,
@@ -89,7 +90,8 @@ pipe(
 | `image` | PIL Image / ndarray / tensor for img2img or inpainting. |
 | `mask_image` | Inpaint mask: white pixels are inpainted, black are preserved. |
 | `strength` | How much noise to add for img2img (0.0–1.0]. 1.0 = full generation. |
-| `cfg_batch_mode` | `"split"` (two separate forwards) or `"concat"` (one batched forward). |
+| `cfg_batch_mode` | `"auto"`, `"split"`, or `"concat"`. Auto uses split CFG for 2.9B and the historical CUDA concat path for base Anima. |
+| `sample_dtype` | `"auto"` keeps denoising latents and CFG arithmetic in float32. Explicit bf16/fp16 is a lower-memory quality tradeoff. |
 | `output_type` | `"pil"` (default), `"np"` (uint8 array), or `"latent"`. |
 
 ### Width / Height constraints
@@ -114,6 +116,12 @@ pipe.scheduler.set_sampling_config(
     s_noise=1.0,
 )
 ```
+
+`from_single_file` and the pipeline constructor detect a 40-block Anima 2.9B
+transformer. When its scheduler still has the historical base-model defaults,
+they are upgraded to `sampler="euler"` and `sigma_schedule="uniform"`. Explicit
+non-default scheduler configurations are preserved. To reapply the detected
+recommendation later, call `pipe.use_recommended_sampling_config()`.
 
 ### Sampler/schedule matrix
 
@@ -149,5 +157,10 @@ pipe.fuse_lora()
 pipe.unfuse_lora()
 pipe.unload_lora_weights()
 ```
+
+On a 40-block model, a complete legacy 28-block LoRA is mapped to its 28
+inherited layers automatically. A partial LoRA whose keys all lie in `0..27` is
+ambiguous and intentionally raises; pass `anima_lora_layout="base28"` to remap
+it or `anima_lora_layout="native"` for a native 40-block LoRA.
 
 See `AnimaLoraLoaderMixin` for the full API surface.

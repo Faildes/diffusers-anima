@@ -1,6 +1,6 @@
 # diffusers-anima
 
-> **Anima 2.9B compatibility:** raw single-file loading infers the main transformer depth from checkpoint keys. Original 28-block Anima and expanded 40-block Anima 2.9B checkpoints are both supported, including `net.*` and `model.diffusion_model.*` wrapper prefixes.
+> **Anima 2.9B compatibility:** raw single-file loading infers the main transformer depth from checkpoint keys. Original 28-block Anima and expanded 40-block Anima 2.9B checkpoints are both supported, including architecture-aware sampling, CFG, latent precision, and legacy 28-block LoRA mapping. See the [Anima 2.9B quality guide](docs/anima_29b_quality.md).
 
 
 `diffusers-anima` provides an Anima pipeline implementation designed to align with [Diffusers](https://github.com/huggingface/diffusers) patterns.
@@ -115,3 +115,4 @@ This code library (`diffusers-anima`) is separately licensed under Apache 2.0.
 | [`docs/api.md`](docs/api.md) | Full API reference (loading, generation, sampling config) |
 | [`docs/development.md`](docs/development.md) | Development setup, test commands, project structure |
 | [`docs/custom_implementations.md`](docs/custom_implementations.md) | Intentional deviations from Diffusers upstream |
+| [`docs/anima_29b_quality.md`](docs/anima_29b_quality.md) | Anima 2.9B quality profile and migration notes |

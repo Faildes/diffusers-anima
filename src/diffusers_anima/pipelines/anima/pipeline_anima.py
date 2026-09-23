@@ -19,6 +19,11 @@ import torch
 import torch.nn.functional as F
 
 from ...loaders.lora_pipeline import AnimaLoraLoaderMixin
+from ...models.anima_architecture import (
+    ANIMA_29B_NUM_LAYERS,
+    anima_variant_from_num_layers,
+    get_anima_transformer_num_layers,
+)
 from ...models.transformers.modeling_anima_transformer import AnimaTransformerModel
 from ...schedulers import AnimaFlowMatchEulerDiscreteScheduler, AnimaSamplingConfig
 from .constants import (
@@ -45,6 +50,7 @@ from .loading import (
     load_prompt_tokenizer,
     loader_options_from_kwargs,
     normalize_loaded_component_buffers,
+    recommended_sampling_config_for_transformer,
     resolve_patch_size,
     resolve_prompt_tokenizer_sources_for_local_dir,
     resolve_vae_scale_factor,
@@ -114,11 +120,12 @@ def _resolve_sample_dtype(
 ) -> torch.dtype:
     """Resolve the denoising latent dtype.
 
-    Diffusers-style pipelines usually keep latents in the inference/model dtype on
-    CUDA. The previous Anima path always used float32 latents, forcing a cast into
-    ``model_dtype`` at every transformer step and then promoting the result back
-    to float32. ``auto`` keeps the older stable float32 path on CPU, but uses the
-    model dtype on CUDA/MPS when it is a common inference dtype.
+    Anima's reference sampler keeps the evolving latent state and CFG arithmetic
+    in float32 even when the transformer itself runs in bfloat16.  This matters
+    more for the 40-block Anima 2.9B network, where low-precision integration
+    error accumulates through the deeper residual stack.  ``auto`` therefore
+    chooses the quality-preserving float32 path on every device.  Callers can
+    still explicitly request ``bfloat16`` or ``float16`` as a speed/memory tradeoff.
     """
     if isinstance(sample_dtype, torch.dtype):
         return sample_dtype
@@ -129,17 +136,22 @@ def _resolve_sample_dtype(
         raise ValueError(f"Unsupported sample_dtype: {sample_dtype}")
     if mapped is not None:
         return mapped
-    if execution_device in {"cuda", "mps"} and model_dtype in {
-        torch.float16,
-        torch.bfloat16,
-    }:
-        return model_dtype
     return torch.float32
 
 
-def _resolve_effective_cfg_batch_mode(cfg_batch_mode: str, *, execution_device: str) -> str:
+def _resolve_effective_cfg_batch_mode(
+    cfg_batch_mode: str,
+    *,
+    execution_device: str,
+    transformer_num_layers: int | None = None,
+) -> str:
     """Resolve ``cfg_batch_mode='auto'`` to a concrete execution strategy."""
     if cfg_batch_mode == "auto":
+        # The published 2.9B reference performs positive and negative CFG as
+        # separate forwards.  Preserve that numerically conservative path for
+        # the deeper model; explicit ``concat`` remains available to callers.
+        if transformer_num_layers == ANIMA_29B_NUM_LAYERS:
+            return "split"
         # CUDA benefits most from the Diffusers-style batched CFG forward. CPU/MPS
         # often prefer lower peak memory and avoid the doubled batch.
         return "concat" if execution_device == "cuda" else "split"
@@ -340,7 +352,9 @@ def _generate_image(
         raise ValueError("num_inference_steps must be >= 1")
     use_cfg = guidance_scale > 1.0
     effective_cfg_batch_mode = _resolve_effective_cfg_batch_mode(
-        cfg_batch_mode, execution_device=pipe.execution_device
+        cfg_batch_mode,
+        execution_device=pipe.execution_device,
+        transformer_num_layers=get_anima_transformer_num_layers(pipe.transformer),
     )
     if prompt_embeds is not None:
         batch_size = prompt_embeds.shape[0]
@@ -629,6 +643,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             scheduler=resolved_scheduler,
             text_encoder=text_encoder,
         )
+        self.use_recommended_sampling_config(force=False)
 
         # Diffusers passes [None, None] for model_index.json entries with null library/class.
         # Normalize to None so downstream checks work correctly.
@@ -641,6 +656,40 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.use_module_cpu_offload = use_module_cpu_offload
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
+
+    def use_recommended_sampling_config(self, *, force: bool = True) -> bool:
+        """Apply architecture-aware sampler defaults.
+
+        At construction time, a 40-block model is updated only when its saved
+        scheduler still carries the historical 28-block defaults. Explicit
+        non-default scheduler choices are preserved. Calling this method with
+        the default ``force=True`` always selects the recommendation for the
+        active architecture.
+        """
+        recommended_sampler, recommended_schedule = (
+            recommended_sampling_config_for_transformer(self.transformer)
+        )
+        current = self.scheduler.get_sampling_config()
+        if not force and (
+            (current.sampler, current.sigma_schedule) != ("euler_a_rf", "beta")
+            or (recommended_sampler, recommended_schedule) == ("euler_a_rf", "beta")
+        ):
+            return False
+        if (current.sampler, current.sigma_schedule) == (
+            recommended_sampler,
+            recommended_schedule,
+        ):
+            return False
+        self.scheduler.set_sampling_config(
+            sampler=recommended_sampler,
+            sigma_schedule=recommended_schedule,
+            beta_alpha=current.beta_alpha,
+            beta_beta=current.beta_beta,
+            eta=current.eta,
+            s_noise=current.s_noise,
+            er_sde_max_stage=current.er_sde_max_stage,
+        )
+        return True
 
     @property
     def execution_device(self) -> str:
@@ -683,6 +732,16 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     def spatial_step(self) -> int:
         """Return the required pixel step for width/height alignment."""
         return self.vae_scale_factor * self.patch_size
+
+    @property
+    def transformer_num_layers(self) -> int | None:
+        """Detected main-transformer depth (28 for base, 40 for Anima 2.9B)."""
+        return get_anima_transformer_num_layers(self.transformer)
+
+    @property
+    def model_variant(self) -> str:
+        """Return ``base``, ``2.9b``, or ``custom`` from the active architecture."""
+        return anima_variant_from_num_layers(self.transformer_num_layers)
 
     def check_inputs(
         self,
@@ -859,12 +918,14 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             guidance_scale: Classifier-free guidance scale.
             generator: Optional RNG seed(s).
             cfg_batch_mode: How to run classifier-free guidance. ``auto`` uses
+                the reference ``split`` path for Anima 2.9B; base Anima uses
                 Diffusers-style batched CFG on CUDA and ``split`` elsewhere.
                 ``split`` runs positive and negative conditioning as two sequential
                 forward passes. ``concat`` batches them into a single forward.
-            sample_dtype: Latent/sampling dtype. ``auto`` uses the model dtype on
-                CUDA/MPS when possible and float32 on CPU. Use ``float32`` to keep
-                the older more conservative path.
+            sample_dtype: Latent/sampling dtype. ``auto`` keeps latent integration
+                and CFG arithmetic in float32, matching the quality-preserving
+                Anima reference path. Explicit ``bfloat16``/``float16`` trades
+                some numerical fidelity for lower memory use.
             check_finite: Run per-step NaN/Inf checks for fp16 debugging. Disabled
                 by default because it forces GPU synchronisation every step.
             output_type: ``pil``, ``np``, or ``latent``.

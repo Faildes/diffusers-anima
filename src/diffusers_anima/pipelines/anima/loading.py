@@ -23,6 +23,10 @@ from ...models.transformers.modeling_anima_transformer import (
     AnimaTransformerModel,
     _convert_anima_state_dict_to_diffusers,
 )
+from ...models.anima_architecture import (
+    ANIMA_29B_NUM_LAYERS,
+    get_anima_transformer_num_layers,
+)
 from ...schedulers import AnimaFlowMatchEulerDiscreteScheduler
 from .constants import (
     ANIMA_VAE_CONFIG,
@@ -686,6 +690,22 @@ def load_transformer_native(
     return transformer
 
 
+def recommended_sampling_config_for_transformer(
+    transformer: AnimaTransformerModel,
+) -> tuple[str, str]:
+    """Return quality-oriented defaults for the detected Anima architecture.
+
+    The original Anima implementation used ancestral RF Euler with the beta
+    schedule as its historical default.  The released Anima 2.9B reference and
+    model card recommend deterministic Euler with the SGM/uniform schedule.
+    Keep the old behavior for 28-block and unknown variants while selecting the
+    2.9B reference path for an actual 40-block checkpoint.
+    """
+    if get_anima_transformer_num_layers(transformer) == ANIMA_29B_NUM_LAYERS:
+        return "euler", "uniform"
+    return "euler_a_rf", "beta"
+
+
 def _recast_module_to_parameter_dtype(module: torch.nn.Module | None) -> None:
     """Recast non-persistent buffers to the module parameter dtype/device.
 
@@ -880,10 +900,15 @@ def build_anima_pipeline(
 
     resolved_scheduler = scheduler
     if resolved_scheduler is None:
+        sampler, sigma_schedule = recommended_sampling_config_for_transformer(
+            transformer
+        )
         resolved_scheduler = AnimaFlowMatchEulerDiscreteScheduler(
             num_train_timesteps=1000,
             shift=3.0,
             use_dynamic_shifting=False,
+            sampler=sampler,
+            sigma_schedule=sigma_schedule,
         )
     else:
         resolved_scheduler = coerce_anima_scheduler(resolved_scheduler)

@@ -151,9 +151,15 @@ def load_pipeline(args: argparse.Namespace) -> AnimaPipeline:
     # set_sampling_config persists values into the scheduler's config dict so
     # they survive scheduler reconstruction with from_config().
     # Option A: mutate the existing scheduler in-place
+    recommended_sampler = "euler" if pipe.model_variant == "2.9b" else "euler_a_rf"
+    recommended_schedule = "uniform" if pipe.model_variant == "2.9b" else "beta"
+    sampler = recommended_sampler if args.sampler == "auto" else args.sampler
+    sigma_schedule = (
+        recommended_schedule if args.sigma_schedule == "auto" else args.sigma_schedule
+    )
     pipe.scheduler.set_sampling_config(
-        sampler=args.sampler,
-        sigma_schedule=args.sigma_schedule,
+        sampler=sampler,
+        sigma_schedule=sigma_schedule,
         eta=args.eta,
         s_noise=args.s_noise,
     )
@@ -161,13 +167,14 @@ def load_pipeline(args: argparse.Namespace) -> AnimaPipeline:
     # sigma-schedule options not exposed by set_sampling_config)
     pipe.scheduler = AnimaFlowMatchEulerDiscreteScheduler.from_config(
         pipe.scheduler.config,
-        sampler=args.sampler,
-        sigma_schedule=args.sigma_schedule,
+        sampler=sampler,
+        sigma_schedule=sigma_schedule,
         eta=args.eta,
         s_noise=args.s_noise,
     )
     print(
-        f"  sampler={args.sampler}  sigma_schedule={args.sigma_schedule}"
+        f"  model_variant={pipe.model_variant}  sampler={sampler}"
+        f"  sigma_schedule={sigma_schedule}"
         f"  eta={args.eta}  s_noise={args.s_noise}"
     )
 
@@ -342,10 +349,10 @@ def parse_args() -> argparse.Namespace:
                    help="Enable VAE tiling")
     p.add_argument("--vae-xformers", action="store_true",
                    help="Enable VAE xformers attention")
-    p.add_argument("--sampler", default="euler_a_rf",
-                   choices=["flowmatch_euler", "euler", "euler_a_rf", "euler_ancestral_rf"])
-    p.add_argument("--sigma-schedule", default="beta",
-                   choices=["beta", "uniform", "simple", "normal"])
+    p.add_argument("--sampler", default="auto",
+                   choices=["auto", "flowmatch_euler", "euler", "euler_a_rf", "euler_ancestral_rf"])
+    p.add_argument("--sigma-schedule", default="auto",
+                   choices=["auto", "beta", "uniform", "simple", "normal"])
     p.add_argument("--eta", type=float, default=1.0)
     p.add_argument("--s-noise", type=float, default=1.0)
     p.add_argument("--lora", default=None,

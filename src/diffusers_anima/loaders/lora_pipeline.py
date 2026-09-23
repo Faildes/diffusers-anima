@@ -11,6 +11,13 @@ from huggingface_hub.utils import EntryNotFoundError, validate_hf_hub_args
 from diffusers.loaders.lora_base import LoraBaseMixin
 from diffusers.utils import USE_PEFT_BACKEND, is_peft_version, logging
 
+from ..models.anima_architecture import (
+    ANIMA_29B_BASE_TO_EXPANDED,
+    ANIMA_29B_NUM_LAYERS,
+    ANIMA_BASE_NUM_LAYERS,
+    get_anima_transformer_num_layers,
+)
+
 
 logger = logging.get_logger(__name__)
 
@@ -171,6 +178,11 @@ _LORA_PARAM_SUFFIXES = (
     "lora_up.bias",
     "alpha",
 )
+
+_DIFFUSERS_ANIMA_LORA_BLOCK_RE = re.compile(
+    r"^(transformer\.)?core\.transformer_blocks\.(\d+)\."
+)
+_ANIMA_LORA_LAYOUTS = {"auto", "base28", "native"}
 
 
 def _normalize_lora_unet_path(path: str) -> str:
@@ -412,6 +424,75 @@ def _convert_non_diffusers_anima_lora_to_diffusers(
     return converted
 
 
+def _collect_diffusers_anima_lora_block_indices(
+    state_dict: dict[str, torch.Tensor],
+) -> set[int]:
+    return {
+        int(match.group(2))
+        for key in state_dict
+        if (match := _DIFFUSERS_ANIMA_LORA_BLOCK_RE.match(key)) is not None
+    }
+
+
+def _remap_legacy_anima_lora_for_transformer(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    transformer,
+    layout: str = "auto",
+) -> tuple[dict[str, torch.Tensor], bool]:
+    """Map a 28-block Anima LoRA to inherited blocks of Anima 2.9B.
+
+    A naive application is dangerous because block indices 2..27 exist in both
+    architectures but refer to different semantic layers.  ``auto`` remaps only
+    an unambiguous LoRA covering all 28 base blocks.  Partial LoRAs require an
+    explicit layout so they can never silently corrupt a 40-block generation.
+    """
+    normalized_layout = str(layout).strip().lower()
+    if normalized_layout not in _ANIMA_LORA_LAYOUTS:
+        raise ValueError(
+            "`anima_lora_layout` must be one of: auto, base28, native."
+        )
+
+    if get_anima_transformer_num_layers(transformer) != ANIMA_29B_NUM_LAYERS:
+        return state_dict, False
+
+    block_indices = _collect_diffusers_anima_lora_block_indices(state_dict)
+    if not block_indices or normalized_layout == "native":
+        return state_dict, False
+
+    if normalized_layout == "auto":
+        if block_indices == set(range(ANIMA_BASE_NUM_LAYERS)):
+            normalized_layout = "base28"
+        elif any(index >= ANIMA_BASE_NUM_LAYERS for index in block_indices):
+            return state_dict, False
+        else:
+            raise ValueError(
+                "Ambiguous partial LoRA on Anima 2.9B: all referenced blocks are "
+                "within 0..27, so the loader cannot distinguish a legacy 28-block "
+                "LoRA from a native partial 40-block LoRA. Pass "
+                "`anima_lora_layout='base28'` to remap it or "
+                "`anima_lora_layout='native'` to keep its block indices."
+            )
+
+    if any(index >= ANIMA_BASE_NUM_LAYERS for index in block_indices):
+        raise ValueError(
+            "`anima_lora_layout='base28'` was requested, but the LoRA references "
+            "blocks outside the 28-block base layout."
+        )
+
+    remapped: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        match = _DIFFUSERS_ANIMA_LORA_BLOCK_RE.match(key)
+        if match is None:
+            remapped[key] = value
+            continue
+        base_index = int(match.group(2))
+        expanded_index = ANIMA_29B_BASE_TO_EXPANDED[base_index]
+        start, end = match.span(2)
+        remapped[f"{key[:start]}{expanded_index}{key[end:]}"] = value
+    return remapped, True
+
+
 class AnimaLoraLoaderMixin(LoraBaseMixin):
     _lora_loadable_modules = ["transformer"]
     transformer_name = "transformer"
@@ -473,6 +554,7 @@ class AnimaLoraLoaderMixin(LoraBaseMixin):
         low_cpu_mem_usage = kwargs.pop(
             "low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT_LORA
         )
+        anima_lora_layout = kwargs.pop("anima_lora_layout", "auto")
         if low_cpu_mem_usage and is_peft_version("<", "0.13.0"):
             raise ValueError(
                 "`low_cpu_mem_usage=True` is not compatible with this `peft` version. Please update it with `pip install -U peft`."
@@ -495,6 +577,15 @@ class AnimaLoraLoaderMixin(LoraBaseMixin):
             )
 
         target_transformer = _resolve_pipeline_transformer(self, self.transformer_name)
+        state_dict, was_remapped = _remap_legacy_anima_lora_for_transformer(
+            state_dict,
+            transformer=target_transformer,
+            layout=anima_lora_layout,
+        )
+        if was_remapped:
+            logger.info(
+                "Remapped legacy 28-block Anima LoRA to the inherited Anima 2.9B block layout."
+            )
         self.load_lora_into_transformer(
             state_dict,
             transformer=target_transformer,
