@@ -110,9 +110,8 @@ def sample_er_sde(
     old_denoised: torch.Tensor | None = None
     old_denoised_d: torch.Tensor | None = None
 
-    _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+    _iterable = None
     for i in range(len(sigmas) - 1):
-        _iterable.update(1)
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
         denoised = predict_denoised(
@@ -126,6 +125,9 @@ def sample_er_sde(
             model_dtype=model_dtype,
             check_finite=check_finite,
         )
+        if _iterable is None:
+            _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+        _iterable.update(1)
 
         if i == len(sigmas) - 2:
             latents = denoised
@@ -223,4 +225,6 @@ def sample_er_sde(
         )
         old_denoised = denoised
 
+    if _iterable is not None:
+        _iterable.close()
     return latents

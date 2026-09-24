@@ -75,6 +75,21 @@ def randn_like(
     )
 
 
+def _precompute_cpu_ancestral_noise(
+    latents: torch.Tensor,
+    *,
+    count: int,
+    generator: torch.Generator | list[torch.Generator],
+) -> torch.Tensor:
+    """Create the same per-step CPU draws, transferring the stack once."""
+    shape = tuple(latents.shape)
+    noises = [
+        randn_tensor(shape, device="cpu", dtype=torch.float32, generator=generator)
+        for _ in range(count)
+    ]
+    return torch.stack(noises).to(device=latents.device, dtype=latents.dtype)
+
+
 def _resolve_cfg_batch_mode(cfg_batch_mode: str, *, device_type: str) -> str:
     if cfg_batch_mode == "auto":
         return "concat" if device_type == "cuda" else "split"
@@ -251,9 +266,8 @@ def sample_euler(
             "inpaint sampling requires both `init_image_latents` and `init_noise`."
         )
 
-    _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+    _iterable = None
     for i in range(len(sigmas) - 1):
-        _iterable.update(1)
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
         denoised = _predict_denoised_const(
@@ -267,6 +281,9 @@ def sample_euler(
             model_dtype=model_dtype,
             check_finite=check_finite,
         )
+        if _iterable is None:
+            _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+        _iterable.update(1)
         if i == len(sigmas) - 2:
             latents = denoised
             latents = _run_step_callback(
@@ -301,6 +318,8 @@ def sample_euler(
             timestep=sigma,
             latents=latents,
         )
+    if _iterable is not None:
+        _iterable.close()
     return latents
 
 
@@ -324,6 +343,7 @@ def sample_euler_ancestral_rf(
     inpaint_mask: torch.Tensor | None = None,
     init_image_latents: torch.Tensor | None = None,
     init_noise: torch.Tensor | None = None,
+    prefetch_cpu_noise: bool = False,
 ) -> torch.Tensor:
     """Ancestral RF Euler sampler on a constant (non-flow-match) sigma trajectory."""
     if inpaint_mask is not None and (init_image_latents is None or init_noise is None):
@@ -331,9 +351,40 @@ def sample_euler_ancestral_rf(
             "inpaint sampling requires both `init_image_latents` and `init_noise`."
         )
 
-    _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+    # Scalar schedule arithmetic is independent of latents and RNG. Evaluate
+    # the same operations over the whole schedule once, before the hot loop.
+    sigma_values = sigmas[:-2]
+    next_values = sigmas[1:-1]
+    downstep_ratios = 1.0 + (next_values / sigma_values - 1.0) * eta
+    sigma_down_values = next_values * downstep_ratios
+    alpha_next_values = 1.0 - next_values
+    alpha_down_values = 1.0 - sigma_down_values
+    renoise_squares = (
+        next_values**2
+        - sigma_down_values**2 * alpha_next_values**2 / (alpha_down_values**2)
+    )
+    renoise_coeffs = renoise_squares.clamp_min(0).sqrt()
+    sigma_down_ratios = sigma_down_values / sigma_values
+    alpha_ratios = alpha_next_values / alpha_down_values
+
+    prefetched_noise = None
+    generators = generator if isinstance(generator, list) else [generator]
+    stochastic_steps = len(sigmas) - 2
+    if (
+        prefetch_cpu_noise
+        and eta > 0
+        and stochastic_steps > 0
+        and callback_on_step_end is None
+        and latents.device.type == "cuda"
+        and all(g is not None and g.device.type == "cpu" for g in generators)
+        and stochastic_steps * latents.numel() * latents.element_size() <= 512 * 1024**2
+    ):
+        prefetched_noise = _precompute_cpu_ancestral_noise(
+            latents, count=stochastic_steps, generator=generator
+        )
+
+    _iterable = None
     for i in range(len(sigmas) - 1):
-        _iterable.update(1)
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
         denoised = _predict_denoised_const(
@@ -347,6 +398,9 @@ def sample_euler_ancestral_rf(
             model_dtype=model_dtype,
             check_finite=check_finite,
         )
+        if _iterable is None:
+            _iterable = pipeline.progress_bar(total=len(sigmas) - 1)
+        _iterable.update(1)
         if i == len(sigmas) - 2:
             latents = denoised
             latents = _run_step_callback(
@@ -359,23 +413,19 @@ def sample_euler_ancestral_rf(
             )
             continue
 
-        downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * eta
-        sigma_down = sigma_next * downstep_ratio
-        alpha_ip1 = 1.0 - sigma_next
-        alpha_down = 1.0 - sigma_down
-        renoise_sq = sigma_next**2 - sigma_down**2 * alpha_ip1**2 / (alpha_down**2)
-        renoise_coeff = renoise_sq.clamp_min(0).sqrt()
-
-        sigma_down_ratio = sigma_down / sigma
+        sigma_down_ratio = sigma_down_ratios[i]
         latents = (
             sigma_down_ratio.to(latents.dtype) * latents
             + (1.0 - sigma_down_ratio).to(latents.dtype) * denoised
         )
         if eta > 0:
-            noise = randn_like(latents, generator=generator)
-            latents = (alpha_ip1 / alpha_down).to(
-                latents.dtype
-            ) * latents + noise * s_noise * renoise_coeff.to(latents.dtype)
+            noise = (
+                prefetched_noise[i] if prefetched_noise is not None
+                else randn_like(latents, generator=generator)
+            )
+            latents = alpha_ratios[i].to(latents.dtype) * latents + (
+                noise * s_noise * renoise_coeffs[i].to(latents.dtype)
+            )
         if (
             inpaint_mask is not None
             and init_image_latents is not None
@@ -395,6 +445,8 @@ def sample_euler_ancestral_rf(
             timestep=sigma,
             latents=latents,
         )
+    if _iterable is not None:
+        _iterable.close()
     return latents
 
 
@@ -429,8 +481,8 @@ def sample_flowmatch_euler(
             "inpaint sampling requires both `init_image_latents` and `init_noise`."
         )
 
-    _iterable = pipeline.progress_bar(timesteps)
-    for i, timestep in enumerate(_iterable):
+    _iterable = None
+    for i, timestep in enumerate(timesteps):
         scheduler_timestep = timestep.expand(latents.shape[0]).float()
         model_timestep = (
             scheduler_timestep / float(scheduler.config.num_train_timesteps)
@@ -447,6 +499,9 @@ def sample_flowmatch_euler(
             model_dtype=model_dtype,
             check_finite=check_finite,
         )
+        if _iterable is None:
+            _iterable = pipeline.progress_bar(total=len(timesteps))
+        _iterable.update(1)
 
         latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
         if (
@@ -476,6 +531,8 @@ def sample_flowmatch_euler(
             timestep=timestep,
             latents=latents,
         )
+    if _iterable is not None:
+        _iterable.close()
     return latents
 
 
@@ -502,6 +559,7 @@ def run_const_sigma_samplers(
     inpaint_mask: torch.Tensor | None = None,
     init_image_latents: torch.Tensor | None = None,
     init_noise: torch.Tensor | None = None,
+    prefetch_cpu_noise: bool = False,
 ) -> torch.Tensor:
     """Dispatch to the appropriate non-flowmatch sampler."""
     if len(sigmas) < 2:
@@ -573,6 +631,7 @@ def run_const_sigma_samplers(
             inpaint_mask=inpaint_mask,
             init_image_latents=init_image_latents,
             init_noise=init_noise,
+            prefetch_cpu_noise=prefetch_cpu_noise,
         )
 
     raise ValueError(

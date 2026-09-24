@@ -1,7 +1,7 @@
 """Anima pipeline implementation with Diffusers-style loading conventions."""
 
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator
 import warnings
@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from ...loaders.lora_pipeline import AnimaLoraLoaderMixin
 from ...models.anima_architecture import (
@@ -31,6 +32,7 @@ from .constants import (
     FORGE_BETA_ALPHA,
     FORGE_BETA_BETA,
 )
+from .dev_metrics import GenerationDevMonitor, validate_sample_interval
 from .generator_utils import (
     _normalize_generator,
     _resolve_noise_runtime,
@@ -105,11 +107,55 @@ def _module_execution_context(
             yield
         finally:
             module.to(device="cpu")
-            if execution_device == "cuda":
-                torch.cuda.empty_cache()
+            # Keep freed blocks in PyTorch's allocator for the next stage.
+            # empty_cache() here synchronizes CUDA on every generation.
         return
 
     yield
+
+
+class _FirstPredictionProgress:
+    """Show the real first forward separately from denoising progress.
+
+    This proxy never executes an extra forward. With split CFG the first
+    prediction comprises two forwards, so both finish before the bar closes.
+    """
+
+    def __init__(self, transformer, pipeline, key: tuple, forwards: int):
+        self.transformer = transformer
+        self.pipeline = pipeline
+        self.key = key
+        self.remaining = forwards
+
+    def __call__(self, *args, **kwargs):
+        bar = getattr(self, "bar", None)
+        if self.remaining > 0 and bar is None:
+            config = getattr(self.pipeline, "_progress_bar_config", {}) or {}
+            bar = tqdm(
+                # Compilation has no measurable fraction of completion; a
+                # determinate 0/1 bar misleadingly appears frozen for minutes.
+                total=None,
+                desc="Anima compile / first forward (preparing)",
+                leave=False,
+                disable=bool(config.get("disable", False)),
+            )
+            self.bar = bar
+        try:
+            result = self.transformer(*args, **kwargs)
+        except BaseException:
+            if bar is not None:
+                bar.close()
+            raise
+        if self.remaining > 0:
+            self.remaining -= 1
+            if self.remaining == 0:
+                model_input = args[0] if args else kwargs.get("hidden_states")
+                if isinstance(model_input, torch.Tensor) and model_input.is_cuda:
+                    torch.cuda.synchronize(model_input.device)
+                bar.update(1)
+                bar.close()
+                self.pipeline._anima_warmed_shapes.add(self.key)
+        return result
 
 
 def _resolve_sample_dtype(
@@ -154,8 +200,23 @@ def _resolve_effective_cfg_batch_mode(
             return "split"
         # CUDA benefits most from the Diffusers-style batched CFG forward. CPU/MPS
         # often prefer lower peak memory and avoid the doubled batch.
-        return "concat" if execution_device == "cuda" else "split"
+        return "concat" if torch.device(execution_device).type == "cuda" else "split"
     return cfg_batch_mode
+
+
+def _expand_conditioning_batch(
+    prompt_embeds: torch.Tensor,
+    negative_prompt_embeds: torch.Tensor,
+    *,
+    num_images_per_prompt: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat precomputed conditioning per seed in the same order as prompts."""
+    if num_images_per_prompt == 1:
+        return prompt_embeds, negative_prompt_embeds
+    return (
+        prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0),
+        negative_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,12 +412,22 @@ def _generate_image(
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be >= 1")
     use_cfg = guidance_scale > 1.0
+    requested_cfg_batch_mode = (
+        pipe.fast_cfg_batch_mode
+        if cfg_batch_mode == "auto" and pipe.fast_cfg_batch_mode is not None
+        else cfg_batch_mode
+    )
     effective_cfg_batch_mode = _resolve_effective_cfg_batch_mode(
-        cfg_batch_mode,
+        requested_cfg_batch_mode,
         execution_device=pipe.execution_device,
         transformer_num_layers=get_anima_transformer_num_layers(pipe.transformer),
     )
     if prompt_embeds is not None:
+        prompt_embeds, negative_prompt_embeds = _expand_conditioning_batch(
+            prompt_embeds,
+            negative_prompt_embeds,  # type: ignore[arg-type]
+            num_images_per_prompt=num_images_per_prompt,
+        )
         batch_size = prompt_embeds.shape[0]
         pos_hidden = pos_t5_ids = pos_t5_weights = None
         neg_hidden = neg_t5_ids = neg_t5_weights = None
@@ -496,7 +567,7 @@ def _generate_image(
         pipe.transformer,
         execution_device=pipe.execution_device,
         execution_dtype=pipe.model_dtype,
-        enable_offload=pipe.use_module_cpu_offload,
+        enable_offload=pipe.use_module_cpu_offload and not pipe.keep_transformer_on_device,
     ):
         if prompt_embeds is not None:
             pos_cond = prompt_embeds.to(
@@ -518,6 +589,10 @@ def _generate_image(
                 neg_t5_ids=neg_t5_ids,
                 neg_t5_weights=neg_t5_weights,
             )
+            # The Qwen hidden states and tokenizer inputs are no longer needed.
+            # In particular, keep them out of the denoising peak allocation.
+            del pos_hidden, pos_t5_ids, pos_t5_weights
+            del neg_hidden, neg_t5_ids, neg_t5_weights
 
         pos_cond = pos_cond.to(device=pipe.execution_device, dtype=pipe.model_dtype)
         if neg_cond is not None:
@@ -528,13 +603,31 @@ def _generate_image(
                 pos_cond = torch.cat([pos_cond, neg_cond], dim=0)
                 neg_cond = None
 
+        sampler_transformer = pipe.transformer
+        if getattr(pipe, "_anima_blocks_compiled", False):
+            warmup_key = (
+                tuple(latents.shape),
+                tuple(pos_cond.shape),
+                effective_cfg_batch_mode,
+                str(pipe.model_dtype),
+                str(pipe.execution_device),
+            )
+            warmed_shapes = pipe._anima_warmed_shapes
+            if warmup_key not in warmed_shapes:
+                sampler_transformer = _FirstPredictionProgress(
+                    pipe.transformer,
+                    pipe,
+                    warmup_key,
+                    forwards=2 if use_cfg and effective_cfg_batch_mode == "split" else 1,
+                )
+
         if sampler == "flowmatch_euler":
             if flowmatch_timesteps is None:
                 raise RuntimeError(
                     "Internal error: flowmatch timesteps were not initialized."
                 )
             latents = sample_flowmatch_euler(
-                pipe.transformer,
+                sampler_transformer,
                 pipe.scheduler,
                 pipe,
                 latents,
@@ -558,7 +651,7 @@ def _generate_image(
                     "Internal error: sigma schedule was not initialized."
                 )
             latents = run_const_sigma_samplers(
-                pipe.transformer,
+                sampler_transformer,
                 pipe,
                 latents,
                 sigmas=sigmas,
@@ -579,6 +672,7 @@ def _generate_image(
                 inpaint_mask=inpaint_mask,
                 init_image_latents=init_image_latents,
                 init_noise=init_noise,
+                prefetch_cpu_noise=getattr(pipe, "prefetch_cpu_noise", False),
             )
 
     if output_type == "latent":
@@ -614,6 +708,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
     model_dtype: torch.dtype
     text_encoder_dtype: torch.dtype
     use_module_cpu_offload: bool
+    keep_transformer_on_device: bool
+    fast_cfg_batch_mode: str | None
+    performance_mode: str
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     # prompt_tokenizer is intentionally NOT registered via register_modules because
     # AnimaPromptTokenizer is a custom class without Diffusers save_pretrained/from_pretrained
@@ -654,6 +751,17 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         self.model_dtype = model_dtype
         self.text_encoder_dtype = text_encoder_dtype
         self.use_module_cpu_offload = use_module_cpu_offload
+        self.keep_transformer_on_device = False
+        self.fast_cfg_batch_mode = None
+        self.performance_mode = "standard"
+        self.prefetch_cpu_noise = False
+        self._dev_metrics_enabled = False
+        self._dev_metrics_print = True
+        self._dev_metrics_sample_interval = 0.1
+        self.dev_metrics_last: dict[str, Any] | None = None
+        self.dev_metrics_calls = 0
+        self.dev_metrics_total_seconds = 0.0
+        self.dev_metrics_total_images = 0
         self.vae_scale_factor = resolve_vae_scale_factor(vae=self.vae)
         self.patch_size = resolve_patch_size(transformer=self.transformer)
 
@@ -770,8 +878,12 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
                 "`prompt_embeds` and `negative_prompt_embeds` must both be provided "
                 "or both be None."
             )
+        if num_images_per_prompt < 1:
+            raise ValueError("`num_images_per_prompt` must be >= 1.")
         if prompt_embeds is not None:
-            batch_size = prompt_embeds.shape[0]
+            if prompt_embeds.shape != negative_prompt_embeds.shape:
+                raise ValueError("Positive and negative prompt embeds must have matching shapes.")
+            batch_size = prompt_embeds.shape[0] * num_images_per_prompt
         else:
             prompts, _ = _resolve_prompt_batches(
                 prompt=prompt,
@@ -860,7 +972,7 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             self.transformer,
             execution_device=self.execution_device,
             execution_dtype=self.model_dtype,
-            enable_offload=self.use_module_cpu_offload,
+            enable_offload=self.use_module_cpu_offload and not self.keep_transformer_on_device,
         ):
             pos_cond, neg_cond = _build_cfg_conditions_from_embeddings(
                 self,
@@ -914,7 +1026,9 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             width: Output image width (must be divisible by ``spatial_step``).
             height: Output image height (must be divisible by ``spatial_step``).
             num_inference_steps: Number of denoising steps.
-            num_images_per_prompt: Number of images to generate per prompt.
+            num_images_per_prompt: Number of images per prompt or precomputed
+                prompt-embedding row. Pass one CPU generator per output image
+                for reproducible batching of seeds.
             guidance_scale: Classifier-free guidance scale.
             generator: Optional RNG seed(s).
             cfg_batch_mode: How to run classifier-free guidance. ``auto`` uses
@@ -984,51 +1098,91 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
             s_noise=s_noise,
         )
 
-        try:
-            images = _generate_image(
+        metrics = (
+            GenerationDevMonitor(
                 self,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                image=image,
-                mask_image=mask_image,
-                strength=strength,
-                width=width,
-                height=height,
-                num_inference_steps=num_inference_steps,
-                num_images_per_prompt=num_images_per_prompt,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                sampler=sampler,
-                sigma_schedule=sigma_schedule,
-                beta_alpha=beta_alpha,
-                beta_beta=beta_beta,
-                eta=eta,
-                s_noise=s_noise,
-                er_sde_max_stage=er_sde_max_stage,
-                cfg_batch_mode=cfg_batch_mode,
-                sample_dtype=sample_dtype,
-                check_finite=check_finite,
-                output_type=output_type,
-                callback_on_step_end=callback_on_step_end,
-                callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
+                self._dev_metrics_sample_interval,
+                image_count=(
+                    prompt_embeds.shape[0] if prompt_embeds is not None
+                    else len(prompt) if isinstance(prompt, (list, tuple)) else 1
+                ) * num_images_per_prompt,
             )
-        finally:
-            self.maybe_free_model_hooks()
+            if self._dev_metrics_enabled
+            else nullcontext()
+        )
+        with metrics:
+            try:
+                images = _generate_image(
+                    self,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    image=image,
+                    mask_image=mask_image,
+                    strength=strength,
+                    width=width,
+                    height=height,
+                    num_inference_steps=num_inference_steps,
+                    num_images_per_prompt=num_images_per_prompt,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    sampler=sampler,
+                    sigma_schedule=sigma_schedule,
+                    beta_alpha=beta_alpha,
+                    beta_beta=beta_beta,
+                    eta=eta,
+                    s_noise=s_noise,
+                    er_sde_max_stage=er_sde_max_stage,
+                    cfg_batch_mode=cfg_batch_mode,
+                    sample_dtype=sample_dtype,
+                    check_finite=check_finite,
+                    output_type=output_type,
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=resolved_callback_tensor_inputs,
+                )
+            finally:
+                self.maybe_free_model_hooks()
 
-        if output_type == "pil":
-            output_images: list[Image.Image] | np.ndarray | torch.Tensor = images
-        elif output_type == "np":
-            output_images = np.stack(
-                [np.asarray(image, dtype=np.uint8) for image in images], axis=0
-            )
-        else:
-            output_images = images
+            if output_type == "pil":
+                output_images: list[Image.Image] | np.ndarray | torch.Tensor = images
+            elif output_type == "np":
+                output_images = np.stack(
+                    [np.asarray(image, dtype=np.uint8) for image in images], axis=0
+                )
+            else:
+                output_images = images
 
-        if not return_dict:
-            return (output_images,)
-        return AnimaPipelineOutput(images=output_images)
+            if not return_dict:
+                return (output_images,)
+            return AnimaPipelineOutput(images=output_images)
+
+    def enable_dev_metrics(
+        self, *, sample_interval: float = 0.1, print_report: bool = True
+    ) -> "AnimaPipeline":
+        """Record call times and CUDA VRAM; use only for development profiling.
+
+        The timer includes the first compile if one occurs during the call.
+        Average VRAM is sampled; PyTorch allocated/reserved peaks use CUDA's
+        peak allocator counters, which this feature resets at each call start.
+        """
+        self._dev_metrics_sample_interval = validate_sample_interval(sample_interval)
+        self._dev_metrics_print = bool(print_report)
+        self._dev_metrics_enabled = True
+        return self
+
+    def disable_dev_metrics(self) -> "AnimaPipeline":
+        """Stop measuring subsequent generations without clearing the summary."""
+        self._dev_metrics_enabled = False
+        return self
+
+    def reset_dev_metrics(self) -> "AnimaPipeline":
+        """Clear accumulated call timings and the most recent report."""
+        self.dev_metrics_last = None
+        self.dev_metrics_calls = 0
+        self.dev_metrics_total_seconds = 0.0
+        self.dev_metrics_total_images = 0
+        return self
 
     def compile_components(
         self,
@@ -1071,6 +1225,116 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """Backward-friendly alias for ``compile_components``."""
         return self.compile_components(**kwargs)
 
+    def enable_fast_denoising(
+        self,
+        *,
+        cfg_batch_mode: str = "concat",
+        compile_blocks: bool = True,
+        compile_mode: str | None = None,
+        compile_scope: str = "regional",
+        mode: str = "balanced",
+        device: str | torch.device = "cuda",
+        prefetch_cpu_noise: bool | None = None,
+    ) -> "AnimaPipeline":
+        """Select balanced or maximum-throughput inference without reducing steps.
+
+        Balanced compiles repeated blocks and retains the current component
+        staging policy. Maximum keeps all components on CUDA and compiles the
+        repeated blocks without CUDA Graphs. Graph replay can overwrite a
+        prior Cosmos block output before the next block consumes it. Regional
+        compilation avoids tracing the full 28/40-layer network first. Pass
+        compile_scope='full' to opt into the expensive full-model compilation.
+        The scheduler, steps, model weights and latent dtype are unchanged.
+        CFG batching and compiler kernels can introduce small floating-point
+        differences. Configure LoRA and install any transformer patches first.
+        A new pipeline is required to switch compilation strategies afterward.
+        """
+        if mode not in {"balanced", "maximum"}:
+            raise ValueError("mode must be 'balanced' or 'maximum'.")
+        if cfg_batch_mode not in {"concat", "split"}:
+            raise ValueError("cfg_batch_mode must be 'concat' or 'split'.")
+        if compile_scope not in {"regional", "full"}:
+            raise ValueError("compile_scope must be 'regional' or 'full'.")
+        if compile_scope == "full" and (mode != "maximum" or not compile_blocks):
+            raise ValueError("Full compilation requires mode='maximum' and compile_blocks=True.")
+        if compile_blocks:
+            if compile_mode in {"reduce-overhead", "max-autotune"}:
+                raise ValueError(
+                    "Anima blocks cannot safely use CUDA Graph compile modes; "
+                    "use 'default' or 'max-autotune-no-cudagraphs'."
+                )
+            if mode == "maximum" and compile_mode not in {
+                None, "default", "max-autotune-no-cudagraphs"
+            }:
+                raise ValueError("Maximum mode requires a CUDA Graph-free compile_mode.")
+            if getattr(self, "_anima_blocks_compiled", False):
+                raise RuntimeError("Anima transformer is already compiled; load a new pipeline to change modes.")
+            if getattr(self.transformer, "_compiled_call_impl", None) is not None or hasattr(
+                self.transformer, "_orig_mod"
+            ):
+                raise RuntimeError("Transformer is already compiled; load a new pipeline to change modes.")
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build.")
+            if compile_scope == "regional":
+                core = getattr(self.transformer, "core", None)
+                blocks = getattr(core, "transformer_blocks", None)
+                if blocks is None or not len(blocks):
+                    raise RuntimeError("Cannot find Anima transformer blocks to compile.")
+                block_class = type(blocks[0])
+                if not all(type(block) is block_class for block in blocks):
+                    raise RuntimeError("Anima transformer blocks do not share one class.")
+
+        # torch.compile rejects supplying both mode and options. For maximum
+        # regional compilation, options alone selects the default optimizer
+        # while explicitly disabling CUDA Graphs. For autotune, PyTorch's
+        # no-cudagraphs preset supplies both settings as one mode.
+        compile_kwargs: dict[str, Any] = {"fullgraph": False}
+        if mode == "maximum":
+            if compile_mode == "max-autotune-no-cudagraphs" or (
+                compile_scope == "full" and compile_mode is None
+            ):
+                compile_kwargs["mode"] = "max-autotune-no-cudagraphs"
+            else:
+                compile_kwargs["options"] = {"triton.cudagraphs": False}
+        else:
+            compile_kwargs["mode"] = compile_mode or "default"
+
+        if mode == "maximum":
+            target = torch.device(device)
+            if target.type != "cuda":
+                raise ValueError("Maximum mode requires a CUDA device.")
+            for module in (self.transformer, self.text_encoder, self.vae):
+                if any(getattr(child, "_hf_hook", None) is not None for child in module.modules()):
+                    raise RuntimeError("Remove external offload hooks before enabling maximum mode.")
+            self.transformer.to(device=target, dtype=self.model_dtype)
+            self.text_encoder.to(device=target, dtype=self.text_encoder_dtype)
+            self.vae.to(device=target, dtype=self.model_dtype)
+            self.execution_device = str(target)
+            self.use_module_cpu_offload = False
+            self.keep_transformer_on_device = True
+            if compile_blocks and compile_scope == "full":
+                # Module.compile keeps the original model object and its LoRA,
+                # adapter, and SD_Embed attributes accessible to the pipeline.
+                self.transformer.compile(**compile_kwargs)
+        if compile_blocks and compile_scope == "regional":
+            compile_repeated = getattr(self.transformer, "compile_repeated_blocks", None)
+            if callable(compile_repeated):
+                self.transformer._repeated_blocks = (block_class.__name__,)
+                compile_repeated(**compile_kwargs)
+            else:
+                for block in blocks:
+                    block.compile(**compile_kwargs)
+
+        if compile_blocks:
+            self._anima_blocks_compiled = True
+            self._anima_warmed_shapes = set()
+        self.fast_cfg_batch_mode = cfg_batch_mode
+        self.performance_mode = mode
+        self.prefetch_cpu_noise = (
+            mode == "maximum" if prefetch_cpu_noise is None else bool(prefetch_cpu_noise)
+        )
+        return self
+
     def enable_model_cpu_offload(
         self,
         gpu_id: int | None = None,
@@ -1093,7 +1357,33 @@ class AnimaPipeline(DiffusionPipeline, AnimaLoraLoaderMixin):
         """
         if getattr(self, "_anima_execution_device", "auto") == "auto":
             self._anima_execution_device = device.type if isinstance(device, torch.device) else str(device)
+        self.keep_transformer_on_device = False
         self.use_module_cpu_offload = True
+
+    def enable_persistent_transformer_staging(
+        self, device: str | torch.device = "cuda"
+    ) -> "AnimaPipeline":
+        """Keep the denoiser resident; stage Qwen and VAE only when used.
+
+        Call after loading (and before compilation). Requires enough VRAM for
+        the denoiser plus the active text encoder or VAE and its workspace.
+        Do not combine with external Accelerate/Diffusers offload hooks.
+        """
+        if any(
+            getattr(module, "_hf_hook", None) is not None
+            for module in (self.transformer, self.text_encoder, self.vae)
+        ):
+            raise RuntimeError("Remove external offload hooks before enabling staging.")
+        target = torch.device(device)
+        if target.type == "cpu":
+            raise ValueError("Persistent transformer staging requires an accelerator.")
+        self.text_encoder.to("cpu")
+        self.vae.to("cpu")
+        self.transformer.to(device=target, dtype=self.model_dtype)
+        self.execution_device = str(target)
+        self.use_module_cpu_offload = True
+        self.keep_transformer_on_device = True
+        return self
 
     def enable_vae_slicing(self) -> None:
         """Enable VAE slicing when the backend VAE implementation supports it."""

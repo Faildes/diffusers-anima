@@ -136,15 +136,127 @@ recommendation later, call `pipe.use_recommended_sampling_config()`.
 
 ## Runtime Helpers
 
+Choose one runtime path after loading the pipeline.
+
+### Balanced (existing)
+
 ```python
-pipe.enable_vae_slicing()      # Reduce peak VRAM at slight speed cost
-pipe.disable_vae_slicing()
-
-pipe.enable_vae_tiling()       # For very large images
-pipe.disable_vae_tiling()
-
-pipe.enable_model_cpu_offload()  # Standard Diffusers CPU offload
+pipe.enable_persistent_transformer_staging("cuda:0")
+pipe.enable_fast_denoising(mode="balanced")
 ```
+
+This keeps the Transformer on CUDA, stages Qwen/VAE, batches CFG, and compiles
+the repeated blocks. For less VRAM, use `cfg_batch_mode="split"`.
+
+### Maximum (new)
+
+Use a fresh pipeline with LoRA and transformer patches configured, then:
+
+```python
+pipe.enable_fast_denoising(mode="maximum", device="cuda:0")
+```
+
+All components remain on CUDA; CFG is batched, and the repeated transformer
+blocks use `default` compilation with CUDA Graphs explicitly disabled. This
+reuses compiled code for the 28/40 blocks without risking a previously produced
+Cosmos block tensor being overwritten by CUDA Graph replay. Do not call the
+balanced compiler or `compile_components()` on the same pipeline first.
+The default path passes CUDA Graph settings via `options` only; PyTorch versions
+that reject specifying both `mode` and `options` are supported.
+Benchmark repeated calls with unchanged tensor shapes; regional compilation
+still takes time on the first call. The separate first-forward tqdm uses an
+indeterminate counter because compilation has no measurable percentage. CPU
+generators keep their existing seed behavior.
+Model weights, scheduler, denoising steps, and latent dtype stay unchanged;
+compiled kernels can have small floating-point differences.
+With an explicit CPU generator and `euler_a_rf`, maximum mode also prepares the
+same ancestral noise draws before sampling and transfers them to CUDA together.
+This reduces repeated CPU-to-GPU transfers without changing the generator's
+final state. Prefetch is skipped for callbacks, non-CPU generators, and noise
+stacks over 512 MiB. Pass `prefetch_cpu_noise=False` to disable it for a speed
+comparison or memory-constrained run.
+
+For more aggressive kernel tuning without CUDA Graph replay, pass
+`compile_mode="max-autotune-no-cudagraphs"` on a fresh pipeline; initial
+compilation can take longer. The CUDA Graph modes `reduce-overhead` and
+`max-autotune` are rejected because they can overwrite outputs between Cosmos
+blocks. If compilation is unavailable, use `compile_blocks=False` to retain
+GPU residency and CFG batching. To benchmark full-model compilation, pass
+`compile_scope="full"` on a fresh pipeline; it may compile considerably longer.
+
+### Maximum throughput with precomputed embeddings
+
+Maximum mode keeps models resident, but it cannot merge consecutive calls to
+`pipe(...)` by itself. When generating several images from the same SD_Embed
+embeddings, send 2–4 seeds in one call to use otherwise idle VRAM and increase
+images per second:
+
+```python
+pipe.enable_fast_denoising(mode="maximum", device="cuda:0")
+pipe.enable_dev_metrics(sample_interval=0.1)  # optional benchmark output
+batch_size = 2  # try 2, then 4 if VRAM permits
+for offset in range(0, num_gen, batch_size):
+    batch_seeds = [int(s) for s in seeds[offset : offset + batch_size]]
+    images = pipe(
+        prompt=None,
+        prompt_embeds=embeds,
+        negative_prompt_embeds=negative_embeds,
+        width=w, height=h,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        num_images_per_prompt=len(batch_seeds),
+        generator=[torch.Generator("cpu").manual_seed(s) for s in batch_seeds],
+    ).images
+    for index, image in enumerate(images, start=offset):
+        seed = int(seeds[index])
+        # Move the existing geninfo, PngInfo, display and image.save block here.
+        # Keep image.save(..., pnginfo=metadata) for each index.
+```
+
+`num_images_per_prompt` now repeats each precomputed positive/negative embed
+row for that many images, and validates that the generator list matches the
+expanded batch. Each independent CPU generator advances in the same order as
+the corresponding single-image call. The model sees a larger batch, so fused
+kernels may produce small numerical differences. Image size, model precision,
+sampler, step count, guidance, and RNG algorithm are unchanged. Measure warm
+calls using `pipe.dev_metrics_last["seconds_per_image"]` and its `vram` peaks;
+compare both speed and output on your GPU. Batch generation improves throughput
+when generating multiple images; it does not shorten a single-image request.
+For a single-image benchmark, you can test `compile_mode="max-autotune-no-cudagraphs"`
+on a freshly loaded pipeline; its first compile can take considerably longer.
+
+For VAE slicing/tiling or manual CPU offload, select them separately when
+memory is the priority:
+
+```python
+pipe.enable_vae_slicing()
+pipe.enable_vae_tiling()
+pipe.enable_model_cpu_offload()
+```
+
+### Dev metrics (optional)
+
+```python
+pipe.enable_dev_metrics(sample_interval=0.1)  # compatible with either mode
+image = pipe(prompt_embeds=embeds, negative_prompt_embeds=negative_embeds, ...).images[0]
+report = pipe.dev_metrics_last          # dict, also printed after each call
+pipe.disable_dev_metrics()              # optional; leaves the last report intact
+# pipe.reset_dev_metrics()              # restart the cumulative time and call count
+```
+
+The report gives call duration, accumulated call time, average time per call,
+and, on CUDA, VRAM at the start, time-weighted average, peak, and end. It shows
+both PyTorch allocated and reserved memory; reserved includes the caching
+allocator. `GPU used (all processes)` shows device-wide VRAM when available and
+may include other workloads. Average and device-wide peak are sampled at the
+configured interval; the PyTorch allocated/reserved peaks come from the CUDA
+allocator's exact peak counters, reset at the start of each monitored call.
+The call duration includes first-forward compilation, denoising, and decoding;
+it excludes embedding work done before `pipe(...)` and saving/displaying the
+result afterward. When a call returns a batch, time and VRAM apply to the whole
+batch. CPU/MPS runs still report time and mark VRAM unavailable. This optional
+feature synchronizes CUDA at call boundaries and polls memory during execution,
+so disable it for production throughput measurements.
 
 ---
 
